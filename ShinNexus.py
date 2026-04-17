@@ -339,11 +339,20 @@ def get_bot_policy(cfg: dict = None) -> dict:
         # Fallback auf naechste bekannte Zahl
         quota = min(_BOT_QUOTA_VALUES, key=lambda x: abs(x - quota))
     current = sum(1 for a in _agents if (a.get("type") or "").lower() in ("bot", "b"))
+    # Perso-Count: unique Perso-Hashes (Veriff-bestätigt)
+    perso_hashes = set()
+    for u in _users.values():
+        if u.get("id_verified") and u.get("perso_hash"):
+            perso_hashes.add(u["perso_hash"])
+    if _identity and _identity.get("id_verified") and _identity.get("perso_hash"):
+        perso_hashes.add(_identity["perso_hash"])
     return {
         "quota": quota,
         "label": _BOT_QUOTA_LABELS[quota],
         "current": current,
         "available_values": _BOT_QUOTA_VALUES,
+        "perso_count": len(perso_hashes),
+        "bot_count": current,
     }
 
 
@@ -4021,6 +4030,62 @@ def _btc_write_anchor_json(entry: dict):
         nexus_log("📄 anchor.json geschrieben", "cyan")
     except Exception as e:
         nexus_log(f"⚠️ anchor.json schreiben fehlgeschlagen: {e}", "red")
+
+
+def _nexus_dissolve(migrated_to: str = "") -> None:
+    """Nexus auflösen nach Owner-Migration.
+    Löscht: Identity, Users, Vault, Credentials, Config-Secrets, Wallet.
+    Behält: ShinNexus.py, anchor.json, start.sh, Assets.
+    Ergebnis: Totes Skelett das händisch neu eingerichtet werden muss.
+    """
+    global _identity, _pq_keys, _users, _user_hives, _friends_data
+    try:
+        # Config strippen (nur Skelett-Infos behalten)
+        cfg = load_config()
+        dissolved_cfg = {
+            "dissolved": True,
+            "dissolved_at": int(time.time()),
+            "migrated_to": migrated_to,
+            "former_owner": cfg.get("name", ""),
+            "former_company": cfg.get("license_company", ""),
+            "port": cfg.get("port", 12345),
+        }
+        save_config(dissolved_cfg)
+        # Identity löschen
+        id_path = BASE / "identity.json"
+        if id_path.exists():
+            id_path.unlink()
+        _identity = None
+        _pq_keys = {}
+        # Users löschen
+        _users.clear()
+        _user_hives.clear()
+        _friends_data.clear()
+        users_path = BASE / "users.json"
+        if users_path.exists():
+            users_path.unlink()
+        # Vault löschen
+        vault_dir = BASE / "vault"
+        if vault_dir.exists():
+            import shutil
+            shutil.rmtree(vault_dir, ignore_errors=True)
+        # Credentials löschen
+        cred_dir = BASE / "credentials"
+        if cred_dir.exists():
+            import shutil
+            shutil.rmtree(cred_dir, ignore_errors=True)
+        # Igni-Key löschen
+        for igni in BASE.glob("ShinNexus-Igni-*"):
+            igni.unlink(missing_ok=True)
+        # Wallet löschen
+        wallet_path = BASE / "wallet.json"
+        if wallet_path.exists():
+            wallet_path.unlink()
+        # Logs behalten (für Forensik)
+        nexus_log(f"💀 NEXUS AUFGELÖST. Migriert nach: {migrated_to}", "red")
+        nexus_log("💀 Skelett bleibt stehen. Händische Neueinrichtung erforderlich.", "red")
+    except Exception as e:
+        nexus_log(f"⚠️ Dissolve-Fehler: {e}", "red")
 
 
 def _btc_write_anchor_json_raw(anchor: dict) -> None:
@@ -9341,6 +9406,16 @@ class NexusHandler(BaseHTTPRequestHandler):
         if not self._owner_only_session():
             return
         members = []
+        # Owner zuerst (immer geschützt, nicht löschbar)
+        if _identity:
+            members.append({
+                "shinpai_id": _identity.get("shinpai_id", ""),
+                "has_perso": bool(_identity.get("id_verified")),
+                "has_kk": bool(_identity.get("verified_stripe")),
+                "is_secondary": False,
+                "type": "Owner",
+                "perso_protected": True,  # Owner ist IMMER geschützt
+            })
         for uname, u in _users.items():
             sid = u.get("shinpai_id", "")
             has_perso = bool(u.get("id_verified"))
@@ -11549,12 +11624,23 @@ if(vl>=3){{
         name = session.get("name", "")
         data = self._parse_json() or {}
         target_url = (data.get("target_url") or "").strip().rstrip("/")
-        # Owner kann nicht einfach migrieren (30-Tage-Countdown-Feature)
+        # Owner-Migration: nur nach 30-Tage-Countdown erlaubt
         if _identity and sid == _identity.get("shinpai_id"):
-            self._send_json({
-                "error": "Owner-Migration laeuft ueber /api/migrate/owner-start (30-Tage-Countdown)",
-            }, 403)
-            return
+            cfg_mig = load_config()
+            mig_start = cfg_mig.get("owner_migrate_started", 0)
+            if not mig_start:
+                self._send_json({
+                    "error": "Owner-Migration erst über den 30-Tage-Countdown starten (Sicherheits-Tab).",
+                }, 403)
+                return
+            elapsed = time.time() - mig_start
+            if elapsed < 30 * 86400:
+                days_left = int((30 * 86400 - elapsed) / 86400) + 1
+                self._send_json({
+                    "error": f"Owner-Migration: Noch {days_left} Tage Wartezeit.",
+                }, 403)
+                return
+            # 30 Tage abgelaufen → Owner darf migrieren!
         if name not in _users:
             self._send_json({"error": "User nicht gefunden"}, 404)
             return
@@ -11653,7 +11739,11 @@ if(vl>=3){{
             return
         name = entry.get("name", "")
         sid = entry.get("shinpai_id", "")
-        user = _users.get(name)
+        # Owner oder normaler User?
+        if _identity and _identity.get("shinpai_id") == sid:
+            user = _identity
+        else:
+            user = _users.get(name)
         if not user or user.get("shinpai_id") != sid:
             self._send_json({"error": "User nicht mehr vorhanden"}, 404)
             return
@@ -11728,20 +11818,27 @@ if(vl>=3){{
             return
         name = entry.get("name", "")
         sid = entry.get("shinpai_id", "")
-        if name not in _users:
+        # Owner-Migration?
+        is_owner_migrate = _identity and _identity.get("shinpai_id") == sid
+        if not is_owner_migrate and name not in _users:
             self._send_json({"error": "User nicht vorhanden"}, 404)
             return
-        # Soft-Lock: User bleibt in DB, aber Login ist gesperrt
-        _users[name]["migrated_to"] = target_url
-        _users[name]["migrated_at"] = int(time.time())
-        _save_users()
-        # Token verbrauchen
+        if is_owner_migrate:
+            # Owner migriert → Nexus auflösen!
+            nexus_log(f"🔴 OWNER-MIGRATION CONFIRMED → Nexus wird aufgelöst! → {target_url}", "red")
+            _nexus_dissolve(target_url)
+        else:
+            # Normaler User: Soft-Lock
+            _users[name]["migrated_to"] = target_url
+            _users[name]["migrated_at"] = int(time.time())
+            _save_users()
         tokens.pop(token, None)
-        nexus_log(f"✅ User {name} ({sid}) migriert nach {target_url} - Login gesperrt", "green")
-        self._send_json({"ok": True, "migrated": name, "target": target_url})
+        nexus_log(f"✅ {'OWNER' if is_owner_migrate else 'User'} {name} ({sid}) migriert nach {target_url}", "green")
+        self._send_json({"ok": True, "migrated": name, "target": target_url, "dissolved": is_owner_migrate})
 
     def _handle_migrate_import(self):
         """POST /api/migrate/import — Ziel-Nexus empfaengt Migration (KEIN Auth noetig!).
+        Bei ownerless Nexus: owner_password + owner_totp → migrierter User wird Owner.
 
         Body: {migration_string: "base64-JSON"}
         Flow:
@@ -11751,6 +11848,7 @@ if(vl>=3){{
           4. User in _users, _user_hives, _friends_data anlegen
           5. source_url/api/migrate/confirm rufen damit Source-Account gesperrt wird
         """
+        global _identity, _pq_keys
         # Rate-Limit: max 3 Import-Versuche/min/IP (zaehlt NICHT als Abuse-Fail)
         ip = self._client_ip()
         now = time.time()
@@ -11779,9 +11877,9 @@ if(vl>=3){{
             if code not in (409, 503, 429):
                 _migrate_abuse_register_fail(ip, reason=reason[:60])
 
-        # Migration braucht offenen Vault am Target — sonst kann kein User gespeichert werden
-        if not vault_is_unlocked():
-            # KEIN Abuse-Fail — das ist Owner-Problem, nicht Hack
+        # Owner-Migration? Wenn kein Owner existiert UND PW+2FA mitgeschickt → auto_owner!
+        auto_owner = _identity is None
+        if not auto_owner and not vault_is_unlocked():
             self._send_json({
                 "error": "Nexus gerade gebootet! Owner muss erst freigeben!",
             }, 503)
@@ -11882,26 +11980,80 @@ if(vl>=3){{
         if user.get("shinpai_id") != sid or user.get("name") != name:
             _fail("Bundle passt nicht zu Migration-Token", 400)
             return
-        _users[name] = {
-            "name": user["name"],
-            "email": user.get("email", ""),
-            "shinpai_id": user["shinpai_id"],
-            "password_hash": user.get("password_hash", ""),
-            "password_salt": user.get("password_salt", ""),
-            "totp_secret": user.get("totp_secret", ""),
-            "totp_confirmed": user.get("totp_confirmed", False),
-            "email_verified": user.get("email_verified", False),
-            "recovery_seed_hash": user.get("recovery_seed_hash", ""),
-            "pq_keys": user.get("pq_keys", {}),
-            "created": user.get("created", int(time.time())),
-            "migrated_from": source_url,
-            "migrated_at_target": int(time.time()),
-        }
+
+        if auto_owner:
+            # Owner-Migration: PW + 2FA gegen Bundle-Daten verifizieren
+            owner_pw = data.get("owner_password", "")
+            owner_totp = data.get("owner_totp", "")
+            if not owner_pw or not owner_totp:
+                _fail("Passwort + 2FA-Code erforderlich für Owner-Migration", 400)
+                return
+            # PW prüfen
+            pw_hash = user.get("password_hash", "")
+            pw_salt = user.get("password_salt", "")
+            if not _verify_password(owner_pw, pw_hash, pw_salt):
+                _fail("Falsches Passwort", 401)
+                return
+            # 2FA prüfen
+            totp_secret = user.get("totp_secret", "")
+            if not totp_verify(totp_secret, owner_totp):
+                _fail("Falscher 2FA-Code", 401)
+                return
+            # Vault + Identity erstellen (1:1 wie Kneipe-Provisioning!)
+            vault_unlock(owner_pw)
+            pq_keys = user.get("pq_keys") or _generate_user_keypair()
+            _identity = {
+                "name": user["name"],
+                "email": user.get("email", ""),
+                "shinpai_id": user["shinpai_id"],
+                "password_hash": pw_hash,
+                "password_salt": pw_salt,
+                "totp_secret": totp_secret,
+                "totp_confirmed": user.get("totp_confirmed", True),
+                "email_verified": user.get("email_verified", False),
+                "recovery_seed_hash": user.get("recovery_seed_hash", ""),
+                "pq_keys": pq_keys,
+                "created": user.get("created", int(time.time())),
+                "migrated_from": source_url,
+                "migrated_at_target": int(time.time()),
+            }
+            _pq_keys = pq_keys
+            _save_identity()
+            _save_recovery_data(owner_pw, "")  # Kein neuer Seed — alter bleibt gültig
+            cfg2 = load_config()
+            cfg2["name"] = user["name"]
+            cfg2["email"] = user.get("email", "")
+            cfg2["shinpai_id"] = user["shinpai_id"]
+            cfg2["mode"] = "server"
+            save_config(cfg2)
+            _igni_init(cfg2)
+            if cfg2.get("owner_vault_mode", "standard") == "standard":
+                igni_save(owner_pw)
+            system_vault_init(cfg2, owner_password=owner_pw)
+            _placeholder_dismiss()
+            nexus_log(f"👑 OWNER-MIGRATION: {name} ({sid}) von {source_url}", "green")
+        else:
+            # Normaler User-Import
+            _users[name] = {
+                "name": user["name"],
+                "email": user.get("email", ""),
+                "shinpai_id": user["shinpai_id"],
+                "password_hash": user.get("password_hash", ""),
+                "password_salt": user.get("password_salt", ""),
+                "totp_secret": user.get("totp_secret", ""),
+                "totp_confirmed": user.get("totp_confirmed", False),
+                "email_verified": user.get("email_verified", False),
+                "recovery_seed_hash": user.get("recovery_seed_hash", ""),
+                "pq_keys": user.get("pq_keys", {}),
+                "created": user.get("created", int(time.time())),
+                "migrated_from": source_url,
+                "migrated_at_target": int(time.time()),
+            }
+            _save_users()
         _user_hives[name] = bundle.get("hives", []) or []
         _friends_data[sid] = bundle.get("friends", {
             "friends": [], "pending_in": [], "pending_out": [], "blocked": [],
         })
-        _save_users()
         # 5. Source-Confirm triggern (Source sperrt alten Account)
         try:
             my_port = cfg.get("port", DEFAULT_PORT)
@@ -12208,6 +12360,8 @@ if(vl>=3){{
 
         # Verifiziert-durch Text (für Login-Seite, vor allen Branches berechnen!)
         _lcfg = load_config()
+        _veriff_on = bool(_lcfg.get("veriff_enabled", True) and _lcfg.get("veriff_api_key"))
+        _member_count = sum(1 for u in _users.values() if u.get("id_verified")) + (1 if _identity and _identity.get("id_verified") else 0)
         _lcompany = _lcfg.get("license_company", "")
         _lglow = _lcfg.get("license_glow_color", "#7ab8e0")
         _llogo = _lcfg.get("license_logo", "")
@@ -12298,7 +12452,7 @@ if(vl>=3){{
                 <!-- Add-Formular: Smart-Paste -->
                 <div style="background:linear-gradient(135deg,rgba(90,200,140,0.08),rgba(10,15,25,0.6));padding:12px;border-radius:8px;margin-bottom:14px;border:1px solid rgba(90,200,140,0.25);">
                   <div style="font-size:12px;color:#5ac88c;font-weight:bold;margin-bottom:8px;">➕ Neuen Eintrag hinzufügen</div>
-                  <textarea id="wl-paste" placeholder="Fingerabdruck hier einfügen (Format: ShinNexus vX.Y.Z · <hash> · <txid>)" oninput="doWhitelistParsePreview()" rows="2" style="width:100%;margin-bottom:5px;font-size:11px;padding:7px;font-family:monospace;resize:vertical;box-sizing:border-box;"></textarea>
+                  <input type="text" id="wl-paste" placeholder="Fingerabdruck hier einfügen" oninput="doWhitelistParsePreview()" style="width:100%;margin-bottom:5px;font-size:11px;padding:8px;box-sizing:border-box;">
                   <div id="wl-parse-preview" style="display:none;font-size:10px;color:#887755;margin-bottom:6px;padding:6px 8px;background:rgba(10,15,25,0.6);border-radius:4px;border:1px solid rgba(122,184,224,0.15);font-family:monospace;line-height:1.6;"></div>
                   <input type="text" id="wl-label" placeholder="Label (optional, z.B. Shinpai-AI Official)" maxlength="64" style="margin-bottom:8px;font-size:12px;padding:7px;">
                   <button onclick="doWhitelistAdd()" class="btn" style="font-size:12px;width:100%;background:rgba(90,200,140,0.15);border:1px solid rgba(90,200,140,0.45);color:#5ac88c;">🦋 Hinzufügen</button>
@@ -12319,11 +12473,11 @@ if(vl>=3){{
                 server_tab_btn = """<button onclick="showDashTab('server')" class="dash-tab" data-tab="server" id="dtab-server" style="font-size:11px;padding:8px 14px;background:none;border:1px solid transparent;border-bottom:1px solid #2a2a3a;border-radius:6px 6px 0 0;margin-bottom:-1px;color:#665540;cursor:pointer;position:relative;z-index:1;">⚙️ Server</button>"""
                 server_tab_content = """
               <div id="dash-server" class="dash-tab-content" style="display:none;background:rgba(20,20,30,0.6);border:1px solid #2a2a3a;border-top:1px solid #2a2a3a;border-radius:0 8px 8px 8px;padding:15px;">
-                <!-- Bot-Quote (edel bronze-gold, kompakt, eine Zeile) -->
-                <div id="bot-quota-tile" style="background:linear-gradient(135deg,#1a1208,#0d0804);padding:10px 14px;border-radius:8px;margin-bottom:10px;border:1px solid rgba(212,168,80,0.35);box-shadow:inset 0 0 24px rgba(212,168,80,0.05);">
-                  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-                    <div style="font-size:12px;color:#d4a850;font-weight:bold;letter-spacing:1px;flex:0 0 auto;text-shadow:0 0 6px rgba(212,168,80,0.3);">🤖 Bot-Quote</div>
-                    <select id="bot-quota-select" style="flex:0 0 auto;font-size:12px;padding:4px 10px;background:#0d0804;color:#e8c464;border:1px solid rgba(212,168,80,0.4);border-radius:5px;">
+                <!-- Bot-Quote (edel bronze-gold, sauber strukturiert) -->
+                <div id="bot-quota-tile" style="background:linear-gradient(135deg,#1a1208,#0d0804);padding:14px;border-radius:8px;margin-bottom:10px;border:1px solid rgba(212,168,80,0.35);box-shadow:inset 0 0 24px rgba(212,168,80,0.05);">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                    <div style="font-size:12px;color:#d4a850;font-weight:bold;letter-spacing:1px;text-shadow:0 0 6px rgba(212,168,80,0.3);">Bot-Quote</div>
+                    <select id="bot-quota-select" style="font-size:12px;padding:4px 10px;background:#0d0804;color:#e8c464;border:1px solid rgba(212,168,80,0.4);border-radius:5px;">
                       <option value="0">0</option>
                       <option value="20" selected>20</option>
                       <option value="50">50</option>
@@ -12331,13 +12485,13 @@ if(vl>=3){{
                       <option value="200">200</option>
                       <option value="1000">1000</option>
                     </select>
-                    <input type="password" id="bot-quota-pw" placeholder="PW" autocomplete="current-password" style="flex:1;min-width:80px;font-size:11px;padding:4px 8px;background:#0d0804;color:#e8c464;border:1px solid rgba(212,168,80,0.35);">
-                    <input type="text" id="bot-quota-totp" placeholder="2FA" maxlength="6" inputmode="numeric" style="flex:0 0 60px;font-size:11px;padding:4px 6px;background:#0d0804;color:#e8c464;border:1px solid rgba(212,168,80,0.35);text-align:center;letter-spacing:3px;">
-                    <button onclick="doBotQuotaSave()" class="btn" style="flex:0 0 auto;font-size:11px;padding:4px 12px;background:linear-gradient(135deg,#1a1208,#0d0804);border:1px solid rgba(212,168,80,0.6);color:#e8c464;">💾</button>
-                    <div id="bot-quota-current" style="flex:0 0 auto;font-size:10px;color:#8b6f47;">…</div>
                   </div>
-                  <!-- Easter-Egg: klitzekleines Label in matter Bronze, nur bei genauem Hinschauen -->
-                  <div id="bot-quota-label" style="display:none;font-size:9px;color:#8b6f47;opacity:0.5;font-style:italic;letter-spacing:0.5px;margin-top:4px;text-align:right;padding-right:4px;"></div>
+                  <input type="password" id="bot-quota-pw" placeholder="aktuelles Passwort" autocomplete="current-password" style="width:100%;box-sizing:border-box;font-size:11px;padding:8px;margin-bottom:6px;background:#0d0804;color:#e8c464;border:1px solid rgba(212,168,80,0.35);border-radius:8px;text-align:center;">
+                  <input type="text" id="bot-quota-totp" placeholder="2FA-Code" maxlength="6" inputmode="numeric" style="width:100%;box-sizing:border-box;font-size:11px;padding:8px;margin-bottom:8px;background:#0d0804;color:#e8c464;border:1px solid rgba(212,168,80,0.35);border-radius:8px;text-align:center;letter-spacing:4px;">
+                  <button onclick="doBotQuotaSave()" class="btn" style="width:100%;font-size:11px;padding:8px;background:linear-gradient(135deg,#1a1208,#0d0804);border:1px solid rgba(212,168,80,0.6);color:#e8c464;">Ändern</button>
+                  <div id="bot-quota-current" style="font-size:10px;color:#8b6f47;margin-top:6px;text-align:center;">…</div>
+                  <div id="bot-quota-counter" style="font-size:10px;color:#d4a850;margin-top:4px;text-align:center;"></div>
+                  <div id="bot-quota-label" style="display:none;font-size:9px;color:#8b6f47;opacity:0.5;font-style:italic;letter-spacing:0.5px;margin-top:4px;text-align:center;"></div>
                 </div>
                 <!-- Igni — Haus­schlüssel (schwarz mit Lichtfarben) -->
                 <div id="igni-tile" style="display:none;background:linear-gradient(135deg,#050508,#0b0b12);padding:14px;border-radius:8px;margin-bottom:10px;border:1px solid rgba(180,220,255,0.2);box-shadow:inset 0 0 24px rgba(180,220,255,0.05);">
@@ -12565,7 +12719,7 @@ if(vl>=3){{
                 <div style="background:linear-gradient(135deg,rgba(228,68,68,0.08),rgba(10,15,25,0.6));padding:14px;border-radius:8px;margin-top:24px;border:1px solid rgba(228,68,68,0.35);box-shadow:inset 0 0 20px rgba(228,68,68,0.04);">
                   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
                     <div style="font-size:12px;color:#e44;font-weight:bold;letter-spacing:1px;">⚠️ Nexus-Member (destructive)</div>
-                    <button onclick="loadOwnerMembers()" class="btn" style="font-size:10px;padding:3px 10px;background:rgba(228,68,68,0.1);border:1px solid rgba(228,68,68,0.4);color:#e44;">🔄</button>
+                    <span onclick="loadOwnerMembers()" style="cursor:pointer;font-size:14px;color:#e44;opacity:0.6;transition:opacity 0.2s;" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.6'" title="Aktualisieren">🔄</span>
                   </div>
                   <p style="font-size:10px;color:#887755;line-height:1.55;margin-bottom:10px;">
                     Nur Shinpai-IDs (DSGVO). Perso-verifizierte Accounts kann nur der User selbst löschen — Owner hat keinen Zugriff (Anti-Veriff-Farm-Schutz).
@@ -13266,8 +13420,16 @@ if(vl>=3){{
               <div id="share-hint" style="font-size:10px;color:#556677;margin-top:2px;"></div>
             </div>
             """ + verified_html + """
-            <!-- Bot-Icon + Zahl: rechts, direkt ueber den Auth-Tabs, dezent -->
-            <div style="max-width:320px;margin:0 auto 4px;display:flex;justify-content:flex-end;align-items:center;gap:4px;padding-right:2px;">
+            <!-- Perso-LED (links) + Member-Count (mitte) + Bot-Icon (rechts): dezent über den Auth-Tabs -->
+            <div style="max-width:320px;margin:0 auto 4px;display:flex;align-items:center;padding:0 2px;">
+              <div style="flex:1;display:flex;align-items:center;gap:5px;">
+                <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:transparent;border:2px solid """ + ('#4caf50' if _veriff_on else '#e44') + """;box-shadow:0 0 4px """ + ('#4caf50' if _veriff_on else '#e44') + """, 0 0 10px """ + ('#4caf50' if _veriff_on else '#e44') + """, inset 0 0 4px """ + ('#4caf50' if _veriff_on else '#e44') + """;"></span>
+                <span style="font-size:12px;color:#a8873d;letter-spacing:0.8px;font-family:'Georgia',serif;font-style:italic;text-shadow:0 0 5px rgba(140,105,40,0.2);">Verifikation</span>
+              </div>
+              <div style="flex:1;text-align:center;">
+                <span style="font-size:12px;font-family:'Georgia',serif;color:#a8873d;letter-spacing:1.2px;text-shadow:0 0 5px rgba(140,105,40,0.2);">""" + f"{_member_count}" + """<span style="color:#8b6f47;font-size:10px;">/200</span></span>
+              </div>
+              <div style="flex:1;display:flex;align-items:center;gap:4px;justify-content:flex-end;">
               <svg id="login-bot-svg" width="18" height="18" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" style="filter:drop-shadow(0 0 4px rgba(212,168,80,0.4));">
                 <line x1="32" y1="6" x2="32" y2="14" stroke="#d4a850" stroke-width="3"/>
                 <circle cx="32" cy="5" r="3" fill="#e8c464"/>
@@ -13279,6 +13441,7 @@ if(vl>=3){{
                 <line x1="44" y1="46" x2="44" y2="54" stroke="#d4a850" stroke-width="3"/>
               </svg>
               <span id="login-bot-quota" style="font-size:12px;color:#d4a850;letter-spacing:1px;text-shadow:0 0 5px rgba(212,168,80,0.35);">…</span>
+              </div>
             </div>
             <div id="auth-tabs" style="display:flex;justify-content:center;gap:4px;margin-bottom:4px;max-width:320px;margin-left:auto;margin-right:auto;">
               <button onclick="showTab('login')" class="tab-btn active" id="tab-login" style="flex:1;font-size:11px;padding:6px 0;">Anmelden</button>
@@ -13286,7 +13449,7 @@ if(vl>=3){{
               <button onclick="showTab('migrate')" class="tab-btn" id="tab-migrate" style="flex:1;font-size:11px;padding:6px 0;">Migrieren</button>
             </div>
             <!-- Bot-Spruch: mittig unter den Tabs, dezent leuchtend Bronze -->
-            <div id="login-bot-label" style="text-align:center;font-size:10px;color:#d4a850;opacity:0.7;font-style:italic;letter-spacing:0.4px;margin:0 auto 18px;text-shadow:0 0 6px rgba(212,168,80,0.25);">&nbsp;</div>
+            <div id="login-bot-label" style="text-align:center;font-size:10px;color:#d4a850;opacity:0.7;font-style:italic;letter-spacing:0.4px;margin:8px auto 10px;text-shadow:0 0 6px rgba(212,168,80,0.25);">&nbsp;</div>
 
             <!-- MIGRATE -->
             <div id="migrate-box" style="display:none;">
@@ -13365,7 +13528,22 @@ if(vl>=3){{
                 <input type="password" id="claim-pw" placeholder="Passwort (min. 6 Zeichen)" class="input">
                 <input type="password" id="claim-pw2" placeholder="Passwort wiederholen" class="input">
                 <button onclick="doClaim()" class="btn" style="width:100%;margin-top:8px;font-size:15px;">👑 Besitz beanspruchen!</button>
+                <div style="text-align:center;margin-top:14px;padding-top:14px;border-top:1px solid #2a2a3a;">
+                  <button onclick="document.getElementById('claim-step1').style.display='none';document.getElementById('claim-migrate').style.display='block';" style="background:none;border:none;color:#aa78ff;font-size:11px;cursor:pointer;text-decoration:underline;">Bestehenden Account migrieren</button>
+                </div>
                 <div id="claim-msg" style="font-size:12px;margin-top:8px;text-align:center;"></div>
+              </div>
+              <div id="claim-migrate" style="display:none;">
+                <p style="text-align:center;color:#aa78ff;font-size:14px;font-weight:bold;margin-bottom:6px;">Account migrieren</p>
+                <p style="text-align:center;color:#665540;font-size:10px;margin-bottom:12px;line-height:1.5;">Übernimm deinen bestehenden Account von einem anderen ShinNexus als Owner.</p>
+                <input type="text" id="claim-mig-token" placeholder="Migrations-Token einfügen" class="input" style="width:100%;box-sizing:border-box;font-size:11px;">
+                <input type="password" id="claim-mig-pw" placeholder="Dein bestehendes Passwort" class="input" style="margin-top:4px;">
+                <input type="text" id="claim-mig-totp" placeholder="2FA-Code" maxlength="6" inputmode="numeric" class="input" style="margin-top:4px;font-size:18px;text-align:center;letter-spacing:6px;">
+                <button onclick="doClaimMigrate()" class="btn" style="width:100%;margin-top:8px;font-size:14px;background:rgba(170,120,255,0.15);border:1px solid rgba(170,120,255,0.4);color:#aa78ff;">Als Owner migrieren</button>
+                <div style="text-align:center;margin-top:10px;">
+                  <button onclick="document.getElementById('claim-migrate').style.display='none';document.getElementById('claim-step1').style.display='block';" style="background:none;border:none;color:#665540;font-size:11px;cursor:pointer;text-decoration:underline;">← Zurück zur Owner-Einrichtung</button>
+                </div>
+                <div id="claim-mig-msg" style="font-size:12px;margin-top:8px;text-align:center;"></div>
               </div>
               <div id="claim-step2" style="display:none;text-align:center;">
                 <p style="color:#7ab8e0;font-size:14px;margin-bottom:10px;">🔐 2FA einrichten</p>
@@ -14864,6 +15042,18 @@ async function loadBotQuota() {{
     if (d.error) return;
     sel.value = String(d.quota);
     cur.textContent = `${{d.current}}/${{d.quota}}`;
+    // Bot-Counter: Perso × Quote = Max, actual vs max
+    const counter = document.getElementById('bot-quota-counter');
+    if (counter) {{
+      const persoCount = d.perso_count || 0;
+      const maxBots = persoCount * d.quota;
+      const actualBots = d.bot_count || 0;
+      if (maxBots > 0) {{
+        counter.textContent = `${{actualBots}} / ${{maxBots}} Bots (${{persoCount}} Perso × ${{d.quota}})`;
+      }} else {{
+        counter.textContent = persoCount > 0 ? 'Quote: 0 — keine Bots erlaubt' : 'Keine Perso-Lizenzen';
+      }}
+    }}
     // Easter-Egg Label IMMER versteckt bis User speichert — nicht initial zeigen!
   }} catch (e) {{}}
 }}
@@ -15431,7 +15621,20 @@ async function loadOwnerMembers() {{
       box.innerHTML = '<div style="color:#665;font-size:11px;font-style:italic;text-align:center;padding:12px;">Keine Member registriert</div>';
       return;
     }}
-    const rows = d.members.map(m => {{
+    // Sortierung: 1. nicht verifiziert → 2. nur KK → 3. nur Perso → 4. KK+Perso → 5. Bots ganz unten
+    const sorted = [...d.members].sort((a, b) => {{
+      const rank = m => {{
+        const isBot = (m.type || '').toLowerCase().includes('bot');
+        if (isBot) return 5;
+        if (m.has_perso && m.has_kk) return 4;
+        if (m.has_perso) return 3;
+        if (m.has_kk) return 2;
+        return 1;
+      }};
+      return rank(a) - rank(b);
+    }});
+    const persoCount = d.members.filter(m => m.has_perso).length;
+    const rows = sorted.map(m => {{
       const persoColor = m.has_perso ? '#4caf50' : (m.has_kk ? '#d4a850' : '#555');
       const persoLabel = m.has_perso ? 'Perso ✅' : (m.has_kk ? 'nur KK' : '—');
       const deleteBtn = m.perso_protected
@@ -15445,7 +15648,7 @@ async function loadOwnerMembers() {{
         ${{deleteBtn}}
       </div>`;
     }}).join('');
-    box.innerHTML = `<div style="color:#e44;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;text-align:center;">${{d.count}} Member</div>${{rows}}`;
+    box.innerHTML = `<div style="color:#e44;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;text-align:center;">${{d.count}} Member · <span style="color:#4caf50;">${{persoCount}} / 200 verifiziert</span></div>${{rows}}`;
   }} catch (e) {{
     box.innerHTML = '<div style="color:#e55;font-size:11px;">Netzwerkfehler</div>';
   }}
@@ -15876,6 +16079,32 @@ document.addEventListener('keydown', e => {{
       msg.textContent = '✅ Owner erstellt + 2FA aktiv!'; msg.style.color = '#4a4';
       if (d.session_token) document.cookie = 'nexus_session=' + d.session_token + '; path=/; SameSite=Strict; Secure';
       setTimeout(() => location.reload(), 2000);
+    }}
+  }};
+
+  window.doClaimMigrate = async function() {{
+    const mstr = (document.getElementById('claim-mig-token')?.value || '').trim();
+    const pw = document.getElementById('claim-mig-pw')?.value || '';
+    const totp = (document.getElementById('claim-mig-totp')?.value || '').trim();
+    const msg = document.getElementById('claim-mig-msg');
+    if (!mstr) {{ msg.textContent = 'Migrations-Token einfügen!'; msg.style.color = '#e55'; return; }}
+    if (!pw) {{ msg.textContent = 'Passwort eingeben!'; msg.style.color = '#e55'; return; }}
+    if (!totp || totp.length < 6) {{ msg.textContent = '6-stelligen 2FA-Code eingeben!'; msg.style.color = '#e55'; return; }}
+    msg.textContent = '⏳ Migriere als Owner…'; msg.style.color = '#aa78ff';
+    try {{
+      const r = await fetch('/api/migrate/import', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{migration_string:mstr, owner_password:pw, owner_totp:totp}})}});
+      const d = await r.json();
+      if (d.ok) {{
+        msg.innerHTML = '✅ Migriert als Owner! <b>' + (d.migrated || '') + '</b>';
+        msg.style.color = '#4a4';
+        setTimeout(() => location.reload(), 2000);
+      }} else {{
+        msg.textContent = d.error || 'Fehler';
+        msg.style.color = '#e55';
+      }}
+    }} catch (e) {{
+      msg.textContent = 'Netzwerkfehler';
+      msg.style.color = '#e55';
     }}
   }};
 
