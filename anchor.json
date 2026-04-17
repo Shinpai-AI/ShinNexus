@@ -1,10 +1,10 @@
 {
-  "version": "1.5.0",
-  "code_hash": "61afccd3a23114b08991e477fd1babcfbb70eab4f630b5a181c53143a602b876",
-  "txid": "c7bc0c9332b8b80a6393645919b6967eabff9625257de2806d9160ab28ae9bcd",
+  "version": "1.5.5",
+  "code_hash": "04229a445dd882a0ce8fcdc2d6cbf24837677b1ea94f2fbfe20f0db3e3e3c22a",
+  "txid": "13b22c17e9c662eeb4b078b971fb1157811f0bb8a10d39ae6aee9204129508aa",
   "btc_address": "bc1qas36dxrk4xv2f55yz8gndz2wh0yt7hxs45p0v3",
-  "timestamp": 1776463276,
-  "op_return": "SHINPAI-AI:1.5.0:61afccd3a23114b08991e477fd1babcf",
+  "timestamp": 1776466033,
+  "op_return": "SHINPAI-AI:1.5.5:04229a445dd882a0ce8fcdc2d6cbf248",
   "company": "Shinpai-AI",
   "revoked": false,
   "history": [
@@ -109,6 +109,18 @@
       "status": "confirmed",
       "block_height": 945526,
       "confirmed_at": 1776463419
+    },
+    {
+      "txid": "13b22c17e9c662eeb4b078b971fb1157811f0bb8a10d39ae6aee9204129508aa",
+      "code_hash": "04229a445dd882a0ce8fcdc2d6cbf24837677b1ea94f2fbfe20f0db3e3e3c22a",
+      "version": "1.5.5",
+      "timestamp": 1776466033,
+      "address": "bc1qas36dxrk4xv2f55yz8gndz2wh0yt7hxs45p0v3",
+      "op_return": "SHINPAI-AI:1.5.5:04229a445dd882a0ce8fcdc2d6cbf248",
+      "fee_sats": 150,
+      "status": "confirmed",
+      "block_height": 945530,
+      "confirmed_at": 1776466317
     }
   ]
 }

@@ -82,7 +82,7 @@ import signal
 #  KONSTANTEN & PFADE
 # ══════════════════════════════════════════════════════════════════════
 
-VERSION = "1.5.0"  # V1.5.0: Bitcoin Chain-of-Trust, Whitelist-System, Migration-Gatekeeping, Live-Blockchain-Verify, Revoke-Broadcast
+VERSION = "1.5.5"  # V1.5.5: Owner-Migration, Nexus-Dissolve, UI-Polish, Neon-LED, Bot-Counter, Member-Sort, Veriff-Toggle
 APP_NAME = "ShinNexus"
 DEFAULT_PORT = 12345
 
@@ -13522,6 +13522,16 @@ if(vl>=3){{
 
             <div id="claim-box" style="max-width:320px;margin:0 auto;">
               <div id="claim-step1">
+                <div id="share-banner-claim" style="display:none;max-width:320px;margin:0 auto 10px;font-size:12px;color:#556677;text-align:center;">
+                  <div style="margin-bottom:3px;font-style:italic;">Deine Nexus-Adresse:</div>
+                  <div style="display:flex;gap:6px;align-items:center;justify-content:center;">
+                    <span id="share-url-claim" style="font-family:monospace;color:#7ab8e0;font-size:13px;letter-spacing:0.3px;"></span>
+                    <button id="btn-copy-claim" title="Kopieren" style="background:transparent;border:0;color:#7ab8e0;cursor:pointer;padding:2px 4px;display:inline-flex;align-items:center;">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                    </button>
+                  </div>
+                  <div id="share-hint-claim" style="font-size:10px;color:#556677;margin-top:2px;"></div>
+                </div>
                 <p style="text-align:center;color:#7ecfff;font-size:14px;font-weight:bold;margin-bottom:15px;">Kein Owner — Besitz beanspruchen!</p>
                 <input type="text" id="claim-name" placeholder="Username (3-12 Zeichen)" maxlength="12" class="input">
                 <input type="email" id="claim-email" placeholder="E-Mail" class="input">
@@ -13534,8 +13544,18 @@ if(vl>=3){{
                 <div id="claim-msg" style="font-size:12px;margin-top:8px;text-align:center;"></div>
               </div>
               <div id="claim-migrate" style="display:none;">
+                <div id="share-banner-migrate" style="display:none;max-width:320px;margin:0 auto 10px;font-size:12px;color:#556677;text-align:center;">
+                  <div style="margin-bottom:3px;font-style:italic;">Adresse dieses Nexus (als Ziel eintragen):</div>
+                  <div style="display:flex;gap:6px;align-items:center;justify-content:center;">
+                    <span id="share-url-migrate" style="font-family:monospace;color:#7ab8e0;font-size:13px;letter-spacing:0.3px;"></span>
+                    <button id="btn-copy-migrate" title="Kopieren" style="background:transparent;border:0;color:#7ab8e0;cursor:pointer;padding:2px 4px;display:inline-flex;align-items:center;">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                    </button>
+                  </div>
+                  <div id="share-hint-migrate" style="font-size:10px;color:#556677;margin-top:2px;"></div>
+                </div>
                 <p style="text-align:center;color:#aa78ff;font-size:14px;font-weight:bold;margin-bottom:6px;">Account migrieren</p>
-                <p style="text-align:center;color:#665540;font-size:10px;margin-bottom:12px;line-height:1.5;">Übernimm deinen bestehenden Account von einem anderen ShinNexus als Owner.</p>
+                <p style="text-align:center;color:#665540;font-size:10px;margin-bottom:8px;line-height:1.5;">Übernimm deinen bestehenden Account von einem anderen ShinNexus als Owner.</p>
                 <input type="text" id="claim-mig-token" placeholder="Migrations-Token einfügen" class="input" style="width:100%;box-sizing:border-box;font-size:11px;">
                 <input type="password" id="claim-mig-pw" placeholder="Dein bestehendes Passwort" class="input" style="margin-top:4px;">
                 <input type="text" id="claim-mig-totp" placeholder="2FA-Code" maxlength="6" inputmode="numeric" class="input" style="margin-top:4px;font-size:18px;text-align:center;letter-spacing:6px;">
@@ -14015,22 +14035,23 @@ async function _doShareCopy(btnId, urlElId) {{
   }}
 }}
 async function updateShareBanner() {{
-  // Beide Banner (Login + Dashboard) gleichzeitig updaten — identische Daten
+  // Alle Banner gleichzeitig updaten — identische Daten
   const banner1 = document.getElementById('share-banner');
   const banner2 = document.getElementById('share-banner-dash');
-  if (!banner1 && !banner2) return;
+  const banner3 = document.getElementById('share-banner-claim');
+  const banner4 = document.getElementById('share-banner-migrate');
+  const allBanners = [banner1, banner2, banner3, banner4].filter(Boolean);
+  if (!allBanners.length) return;
   try {{
     const r = await fetch('/api/public-url/status', {{headers:{{'X-Session-Token': document.cookie.split(';').find(c => c.trim().startsWith('nexus_session='))?.split('=')[1] || ''}}}});
     const d = await r.json();
     if (d.error || !d.state) {{
-      if (banner1) banner1.style.display = 'none';
-      if (banner2) banner2.style.display = 'none';
+      allBanners.forEach(b => b.style.display = 'none');
       return;
     }}
     // Manuelle URL gesetzt → Banner komplett aus (User kennt seine Domain)
     if (d.public_url_manual) {{
-      if (banner1) banner1.style.display = 'none';
-      if (banner2) banner2.style.display = 'none';
+      allBanners.forEach(b => b.style.display = 'none');
       return;
     }}
     const s = d.state;
@@ -14051,8 +14072,7 @@ async function updateShareBanner() {{
       hint = url ? '— nur für dich lokal' : '';
     }}
     if (!url) {{
-      if (banner1) banner1.style.display = 'none';
-      if (banner2) banner2.style.display = 'none';
+      allBanners.forEach(b => b.style.display = 'none');
       return;
     }}
     // Banner 1 (Login)
@@ -14071,9 +14091,24 @@ async function updateShareBanner() {{
       if (hintEl) hintEl.textContent = hint;
       banner2.style.display = 'block';
     }}
+    // Banner 3 (Claim — Owner-Einrichtung)
+    if (banner3) {{
+      const urlEl = document.getElementById('share-url-claim');
+      const hintEl = document.getElementById('share-hint-claim');
+      if (urlEl) {{ urlEl.textContent = url; urlEl.dataset.url = url; }}
+      if (hintEl) hintEl.textContent = hint;
+      banner3.style.display = 'block';
+    }}
+    // Banner 4 (Claim-Migration)
+    if (banner4) {{
+      const urlEl = document.getElementById('share-url-migrate');
+      const hintEl = document.getElementById('share-hint-migrate');
+      if (urlEl) {{ urlEl.textContent = url; urlEl.dataset.url = url; }}
+      if (hintEl) hintEl.textContent = hint;
+      banner4.style.display = 'block';
+    }}
   }} catch (e) {{
-    if (banner1) banner1.style.display = 'none';
-    if (banner2) banner2.style.display = 'none';
+    allBanners.forEach(b => b.style.display = 'none');
   }}
 }}
 // Copy-Handler für beide Banner (onclick im DOM nachträglich binden, da IDs je nach View)
@@ -14087,6 +14122,16 @@ function _bindShareCopyHandlers() {{
   if (btn2 && !btn2._bound) {{
     btn2.onclick = () => _doShareCopy('btn-copy-share-dash', 'share-url-dash');
     btn2._bound = true;
+  }}
+  const btn3 = document.getElementById('btn-copy-claim');
+  if (btn3 && !btn3._bound) {{
+    btn3.onclick = () => _doShareCopy('btn-copy-claim', 'share-url-claim');
+    btn3._bound = true;
+  }}
+  const btn4 = document.getElementById('btn-copy-migrate');
+  if (btn4 && !btn4._bound) {{
+    btn4.onclick = () => _doShareCopy('btn-copy-migrate', 'share-url-migrate');
+    btn4._bound = true;
   }}
 }}
 // Init: beim Page-Load + alle 30s
