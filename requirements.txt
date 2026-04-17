@@ -1,0 +1,23 @@
+# ShinNexus — Portable Identity Service
+# Minimal Dependencies (konsistent mit Shidow/ShinShare)
+
+cryptography>=42.0
+
+# liboqs-python — PQ Crypto (ML-DSA-65, ML-KEM-768) — PFLICHT (kein Fallback!)
+liboqs-python
+
+# QR-Code für TOTP (Terminal + PNG)
+segno
+
+# TOTP (2FA)
+pyotp
+
+# Verification Provider (Stufe 1: Kreditkartencheck)
+stripe
+
+# Bitcoin — Blockchain-Verankerung (Version-Hash on-chain via OP_RETURN)
+hdwallet
+bitcoin-utils
+
+# Optional:
+# argon2-cffi — Besseres Passwort-Hashing (Fallback: PBKDF2)
