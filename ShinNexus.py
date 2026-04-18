@@ -4003,7 +4003,7 @@ def _btc_check_tx_confirmed(txid: str) -> dict:
         return {"confirmed": False, "block_height": 0, "block_time": 0}
 
 
-ANCHOR_JSON = BASE / "anchor.json"
+ANCHOR_JSON = BASE / "anchor-nexus.json"
 
 
 def _btc_write_anchor_json(entry: dict):
@@ -4027,7 +4027,7 @@ def _btc_write_anchor_json(entry: dict):
             "history": existing,
         }
         ANCHOR_JSON.write_text(json.dumps(anchor, indent=2, ensure_ascii=False), "utf-8")
-        nexus_log("📄 anchor.json geschrieben", "cyan")
+        nexus_log("📄 anchor-nexus.json geschrieben", "cyan")
     except Exception as e:
         nexus_log(f"⚠️ anchor.json schreiben fehlgeschlagen: {e}", "red")
 
@@ -4333,8 +4333,45 @@ def _btc_startup_integrity_check():
     _btc_live_verify_and_persist(anchor, current_hash)
 
 
+def _btc_scan_external_anchors():
+    """Beim Start: Alle anchor-*.json (außer eigene) lesen, Hash in Whitelist eintragen.
+    Keine Blockchain-Verifikation — die passiert wenn das andere Programm sich meldet."""
+    try:
+        for anchor_file in BASE.glob("anchor-*.json"):
+            if anchor_file == ANCHOR_JSON:
+                continue
+            try:
+                ext_anchor = json.loads(anchor_file.read_text("utf-8"))
+                ext_hash = (ext_anchor.get("code_hash") or "").lower()
+                ext_version = ext_anchor.get("version", "?")
+                ext_company = ext_anchor.get("company", anchor_file.stem)
+                if not ext_hash:
+                    continue
+                if ext_anchor.get("revoked"):
+                    nexus_log(f"⚠️ Externer Anchor {anchor_file.name}: WIDERRUFEN — übersprungen", "yellow")
+                    continue
+                cfg = load_config()
+                wl = cfg.get("whitelist") or []
+                if not any((e.get("hash", "").lower() == ext_hash) for e in wl):
+                    wl.append({
+                        "version": ext_version,
+                        "hash": ext_hash,
+                        "txid": (ext_anchor.get("txid") or "").lower(),
+                        "label": f"{ext_company} v{ext_version} ({anchor_file.name})",
+                        "added_at": int(time.time()),
+                        "source": anchor_file.name,
+                    })
+                    cfg["whitelist"] = wl
+                    save_config(cfg)
+                    nexus_log(f"🦋 Whitelist: {anchor_file.name} v{ext_version} eingetragen", "cyan")
+            except Exception as e:
+                nexus_log(f"⚠️ Externer Anchor {anchor_file.name} fehlerhaft: {e}", "yellow")
+    except Exception as e:
+        nexus_log(f"⚠️ Externe Anchor-Scan fehlgeschlagen: {e}", "yellow")
+
+
 def _btc_live_verify_and_persist(anchor: dict | None = None, current_hash: str | None = None) -> dict:
-    """Live-Check und persistiere live_verify_status in anchor.json.
+    """Live-Check und persistiere live_verify_status in anchor-nexus.json.
     Bei match: automatisch eigenen Hash als Whitelist-Default eintragen."""
     if anchor is None:
         anchor = _btc_read_anchor_json()
@@ -16726,6 +16763,8 @@ def start_server(cfg: dict):
 
     # Chain of Trust: Integrity Check (inkl. Live-Blockchain-Verifikation)
     _btc_startup_integrity_check()
+    # Externe Anchors scannen (anchor-kneipe.json etc.) → Auto-Whitelist
+    _btc_scan_external_anchors()
 
     # Live-Anker-Check alle 6h — erkennt auch on-chain-Revokes zuverlässig
     def _btc_live_verify_loop():
