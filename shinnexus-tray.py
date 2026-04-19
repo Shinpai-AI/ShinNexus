@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ShinNexusn-Schlägerei System-Tray Icon.
+"""ShinNexus System-Tray Icon.
 Startet Server, zeigt Status, Rechtsklick-Menü.
 Universell: Linux (AppIndicator3) + Windows (pystray) + macOS (pystray)."""
 
@@ -22,8 +22,9 @@ def _prepare_logo_icon():
     icon_dir.mkdir(exist_ok=True)
     icon_name = "shinnexus-logo"
     path = icon_dir / f"{icon_name}.png"
-    if not path.exists():
-        logo_path = SCRIPT_DIR / "shinnexus.png"
+    # Immer neu erstellen (Cache kann veraltet sein)
+    logo_path = SCRIPT_DIR / "shinnexus.png"
+    if True:
         if logo_path.exists():
             img = Image.open(str(logo_path)).resize((64, 64), Image.LANCZOS)
             img.save(str(path))
