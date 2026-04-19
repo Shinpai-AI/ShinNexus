@@ -26,8 +26,13 @@ def _prepare_logo_icon():
     logo_path = SCRIPT_DIR / "shinnexus.png"
     if True:
         if logo_path.exists():
-            img = Image.open(str(logo_path)).resize((64, 64), Image.LANCZOS)
-            img.save(str(path))
+            logo = Image.open(str(logo_path)).convert("RGBA").resize((64, 64), Image.LANCZOS)
+            # Dunkler runder Hintergrund für Sichtbarkeit im Tray
+            bg = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            d = ImageDraw.Draw(bg)
+            d.ellipse([0, 0, 63, 63], fill=(10, 10, 25, 255))
+            bg.paste(logo, (0, 0), logo)
+            bg.save(str(path))
         else:
             img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
             d = ImageDraw.Draw(img)
