@@ -85,7 +85,13 @@ jobs:
           # App files
           Copy-Item "ShinNexus.py","requirements.txt","start.sh","shinnexus-tray.py" -Destination "installer-build/" -ErrorAction SilentlyContinue
           Copy-Item "*.png","*.webp","*.json","*.ico" -Destination "installer-build/" -ErrorAction SilentlyContinue
+          # Logo explizit kopieren (für Tray-Icon und Installer)
+          Copy-Item "shinnexus.png" -Destination "installer-build/" -ErrorAction SilentlyContinue
           Copy-Item "shinnexus.ico" -Destination "installer-build/" -ErrorAction SilentlyContinue
+          # Logo auch als PNG konvertieren falls nur webp vorhanden
+          if (-not (Test-Path "installer-build/shinnexus.png")) {
+            python -c "from PIL import Image; Image.open('ShinNexus-Logo.webp').convert('RGBA').save('installer-build/shinnexus.png')"
+          }
           Copy-Item "installer/windows/shinnexus-setup.iss" -Destination "." -ErrorAction SilentlyContinue
 
       - name: Build with Inno Setup
