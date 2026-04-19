@@ -3,7 +3,7 @@
 Startet Server, zeigt Status, Rechtsklick-Menü.
 Universell: Linux (AppIndicator3) + Windows (pystray) + macOS (pystray)."""
 
-import os, sys, signal, subprocess, threading, time, webbrowser, tempfile, platform
+import os, sys, signal, subprocess, threading, time, webbrowser, tempfile, platform, ssl
 from pathlib import Path
 from PIL import Image, ImageDraw
 
