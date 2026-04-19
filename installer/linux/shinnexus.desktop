@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ShinNexus
+Comment=Decentralized Identity Service
+Exec=AppRun
+Icon=shinnexus
+Categories=Network;Security;
+Terminal=false

@@ -1,0 +1,106 @@
+name: Build Installers
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install appimagetool
+        run: |
+          wget -q -O appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool
+
+      - name: Build AppImage
+        run: |
+          mkdir -p ShinNexus.AppDir/usr/share/shinnexus
+          cp ShinNexus.py requirements.txt start.sh shinnexus-tray.py ShinNexus.AppDir/usr/share/shinnexus/ 2>/dev/null || true
+          cp *.png *.webp *.json ShinNexus.AppDir/usr/share/shinnexus/ 2>/dev/null || true
+          cp installer/linux/AppRun ShinNexus.AppDir/AppRun
+          chmod +x ShinNexus.AppDir/AppRun
+          cp installer/linux/shinnexus.desktop ShinNexus.AppDir/
+          # Convert logo to PNG for icon
+          python3 -c "from PIL import Image; Image.open('ShinNexus-Logo.webp').save('ShinNexus.AppDir/shinnexus.png')" 2>/dev/null || cp ShinNexus-Shield-edel.png ShinNexus.AppDir/shinnexus.png
+          ln -sf shinnexus.png ShinNexus.AppDir/.DirIcon
+          ARCH=x86_64 ./appimagetool --no-appstream ShinNexus.AppDir ShinNexus-x86_64.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShinNexus-Linux-AppImage
+          path: ShinNexus-x86_64.AppImage
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Create Windows Installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "installer-build" -Force
+          Copy-Item "ShinNexus.py","requirements.txt","start.sh","shinnexus-tray.py" -Destination "installer-build/" -ErrorAction SilentlyContinue
+          Copy-Item "*.png","*.webp","*.json" -Destination "installer-build/" -ErrorAction SilentlyContinue
+          Copy-Item "installer/windows/shinnexus-setup.iss" -Destination "." -ErrorAction SilentlyContinue
+
+      - name: Build with Inno Setup
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.4
+        with:
+          path: shinnexus-setup.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShinNexus-Windows-Setup
+          path: Output/*.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Create macOS App Bundle
+        run: |
+          APP="ShinNexus.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp ShinNexus.py requirements.txt start.sh shinnexus-tray.py "$APP/Contents/Resources/" 2>/dev/null || true
+          cp *.png *.webp *.json "$APP/Contents/Resources/" 2>/dev/null || true
+          cp installer/macos/shinnexus-launcher.sh "$APP/Contents/MacOS/ShinNexus"
+          chmod +x "$APP/Contents/MacOS/ShinNexus"
+          cp installer/macos/Info.plist "$APP/Contents/"
+          hdiutil create -volname "ShinNexus" -srcfolder "$APP" -ov -format UDZO ShinNexus-macOS.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShinNexus-macOS-DMG
+          path: ShinNexus-macOS.dmg
+
+  release:
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ShinNexus-Linux-AppImage/ShinNexus-x86_64.AppImage
+            ShinNexus-Windows-Setup/*.exe
+            ShinNexus-macOS-DMG/ShinNexus-macOS.dmg
+          generate_release_notes: true
