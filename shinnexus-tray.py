@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""ShinNexus System-Tray Icon."""
-import os, sys, signal, subprocess, threading, time, webbrowser, tempfile, ssl
+"""ShinNexusn-Schlägerei System-Tray Icon.
+Startet Server, zeigt Status, Rechtsklick-Menü.
+Universell: Linux (AppIndicator3) + Windows (pystray) + macOS (pystray)."""
+
+import os, sys, signal, subprocess, threading, time, webbrowser, tempfile, platform
 from pathlib import Path
-import gi
-gi.require_version('Gtk', '3.0')
-gi.require_version('AppIndicator3', '0.1')
-from gi.repository import Gtk, AppIndicator3, GLib
-from PIL import Image
+from PIL import Image, ImageDraw
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PORT = 12345
 URL = f"https://localhost:{PORT}"
+IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX = platform.system() == "Linux"
 server_proc = None
 status = "starting"
-indicator = None
+
 
 def _prepare_logo_icon():
+    """Logo als Tray-Icon vorbereiten (skaliert auf 64x64)."""
     icon_dir = Path(tempfile.gettempdir()) / "shinnexus-icons"
     icon_dir.mkdir(exist_ok=True)
     icon_name = "shinnexus-logo"
@@ -26,101 +28,248 @@ def _prepare_logo_icon():
             img = Image.open(str(logo_path)).resize((64, 64), Image.LANCZOS)
             img.save(str(path))
         else:
-            from PIL import ImageDraw
-            img = Image.new("RGBA", (64, 64), (0, 100, 200, 255))
+            img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.ellipse([4, 4, 60, 60], fill=(212, 168, 80, 255))
             img.save(str(path))
-    return str(icon_dir), icon_name
+    return str(icon_dir), icon_name, str(path)
 
-ICON_DIR, ICON_NAME = _prepare_logo_icon()
+ICON_DIR, ICON_NAME, ICON_PATH = _prepare_logo_icon()
+
 
 def kill_old_servers():
+    """Alte Server-Prozesse auf Port killen."""
     try:
-        result = subprocess.run(["lsof", "-t", "-i", f":{PORT}"],
-                                capture_output=True, text=True, timeout=5)
-        if result.stdout.strip():
-            for pid in result.stdout.strip().split("\n"):
-                try: os.kill(int(pid), signal.SIGTERM)
-                except: pass
-            time.sleep(2)
-    except: pass
+        if IS_WINDOWS:
+            # Alle Prozesse auf dem Port finden und killen
+            result = subprocess.run(
+                ["netstat", "-ano"], capture_output=True, text=True, timeout=5)
+            killed = set()
+            for line in result.stdout.split("\n"):
+                if f":{PORT}" in line and "LISTENING" in line:
+                    pid = line.strip().split()[-1]
+                    if pid not in killed and pid != "0":
+                        try:
+                            subprocess.run(["taskkill", "/F", "/PID", pid],
+                                           capture_output=True, timeout=5)
+                            killed.add(pid)
+                        except Exception:
+                            pass
+            if killed:
+                time.sleep(2)
+        else:
+            result = subprocess.run(["lsof", "-t", "-i", f":{PORT}"],
+                                    capture_output=True, text=True, timeout=5)
+            if result.stdout.strip():
+                for pid in result.stdout.strip().split("\n"):
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                    except (ProcessLookupError, ValueError):
+                        pass
+                time.sleep(2)
+    except Exception:
+        pass
 
-def update_icon(new_status):
-    global status
-    status = new_status
-    GLib.idle_add(indicator.set_icon_full, ICON_NAME, f"ShinNexus - {new_status}")
 
-def start_server():
-    global server_proc
+def find_python():
+    """Python finden: venv > embedded python > system python."""
+    candidates = []
+    if IS_WINDOWS:
+        candidates = [
+            SCRIPT_DIR / "venv" / "Scripts" / "python.exe",
+            SCRIPT_DIR / "venv" / "Scripts" / "python3.exe",
+            SCRIPT_DIR / "python" / "python.exe",
+            SCRIPT_DIR / "python" / "pythonw.exe",
+        ]
+    else:
+        candidates = [
+            SCRIPT_DIR / "env" / "bin" / "python3",
+            SCRIPT_DIR / "env" / "bin" / "python3",
+        ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
+
+
+def start_server_process():
+    """Server starten und warten bis er antwortet."""
+    global server_proc, status
+
     kill_old_servers()
-    venv_python = SCRIPT_DIR / "env" / "bin" / "python3"
+
+    python = find_python()
     server_py = SCRIPT_DIR / "ShinNexus.py"
-    if not venv_python.exists():
-        update_icon("error"); return
-    server_proc = subprocess.Popen(
-        [str(venv_python), str(server_py)],
-        cwd=str(SCRIPT_DIR),
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+
+    if not python:
+        status = "error"
+        return
+
+    # Server-Log in Datei schreiben (UTF-8 damit Emojis funktionieren!)
+    log_path = SCRIPT_DIR / "logs"
+    log_path.mkdir(exist_ok=True)
+    log_file = open(str(log_path / "server-stdout.log"), "a", encoding="utf-8")
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    kwargs = {"cwd": str(SCRIPT_DIR), "stdout": log_file, "stderr": log_file, "env": env}
+    if not IS_WINDOWS:
+        kwargs["start_new_session"] = True
+    else:
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    server_proc = subprocess.Popen([python, str(server_py)], **kwargs)
+
     import urllib.request
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
     for _ in range(30):
         time.sleep(1)
         if server_proc.poll() is not None:
-            update_icon("error"); return
+            status = "error"
+            return
         try:
-            urllib.request.urlopen(URL, timeout=2, context=ctx)
-            update_icon("running")
+            ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE; urllib.request.urlopen(URL, timeout=2, context=ctx)
+            status = "running"
             webbrowser.open(URL)
             return
-        except: pass
-    update_icon("error")
+        except Exception:
+            pass
+    status = "error"
+
 
 def monitor_server():
+    """Server-Prozess ueberwachen."""
+    global status
     while True:
         time.sleep(5)
         if server_proc and server_proc.poll() is not None:
-            if status != "error": update_icon("error")
+            if status != "error":
+                status = "error"
 
-def on_open(_): webbrowser.open(URL)
-def on_status(_):
-    msgs = {"running": f"Server läuft auf Port {PORT}",
-            "starting": "Server startet...",
-            "error": "Server-Fehler! Logs prüfen."}
-    d = Gtk.MessageDialog(message_type=Gtk.MessageType.INFO,
-                          buttons=Gtk.ButtonsType.OK,
-                          text="ShinNexus", secondary_text=msgs.get(status, "Unbekannt"))
-    d.run(); d.destroy()
-def on_quit(_):
+
+def quit_app():
+    """Server beenden und App schliessen."""
+    global server_proc
     if server_proc:
-        server_proc.terminate()
-        try: server_proc.wait(timeout=5)
-        except: server_proc.kill()
-    Gtk.main_quit()
+        if IS_WINDOWS:
+            # Windows: taskkill /F /T killt den ganzen Prozessbaum
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(server_proc.pid)],
+                               capture_output=True, timeout=5)
+            except Exception:
+                server_proc.kill()
+        else:
+            server_proc.terminate()
+            try:
+                server_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                server_proc.kill()
+    # Sicherheitshalber: Port nochmal freigeben
+    kill_old_servers()
 
-def main():
-    global indicator
+
+# ═══════════════════════════════════════════
+#  LINUX: AppIndicator3 + GTK3
+# ═══════════════════════════════════════════
+
+def run_linux():
+    import gi
+    gi.require_version('Gtk', '3.0')
+    gi.require_version('AppIndicator3', '0.1')
+    from gi.repository import Gtk, AppIndicator3, GLib
+
     indicator = AppIndicator3.Indicator.new(
         "shinnexus-tray", ICON_NAME,
         AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
     indicator.set_icon_theme_path(ICON_DIR)
     indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+
     menu = Gtk.Menu()
-    for label, handler in [("ShinNexus öffnen", on_open), ("Status", on_status)]:
-        item = Gtk.MenuItem(label=label)
-        item.connect("activate", handler)
-        menu.append(item)
+    item_open = Gtk.MenuItem(label="ShinNexus öffnen")
+    item_open.connect("activate", lambda _: webbrowser.open(URL))
+    menu.append(item_open)
+
+    item_status = Gtk.MenuItem(label="Status")
+    def show_status(_):
+        msgs = {"running": f"Server läuft auf Port {PORT}",
+                "starting": "Server startet...",
+                "error": "Server-Fehler! Logs prüfen."}
+        d = Gtk.MessageDialog(message_type=Gtk.MessageType.INFO,
+                              buttons=Gtk.ButtonsType.OK,
+                              text="ShinNexusn-Schlägerei",
+                              secondary_text=msgs.get(status, "Unbekannt"))
+        d.run(); d.destroy()
+    item_status.connect("activate", show_status)
+    menu.append(item_status)
+
     menu.append(Gtk.SeparatorMenuItem())
-    item = Gtk.MenuItem(label="Beenden")
-    item.connect("activate", on_quit)
-    menu.append(item)
+
+    item_quit = Gtk.MenuItem(label="Beenden")
+    item_quit.connect("activate", lambda _: (quit_app(), Gtk.main_quit()))
+    menu.append(item_quit)
+
     menu.show_all()
     indicator.set_menu(menu)
-    threading.Thread(target=start_server, daemon=True).start()
+
+    threading.Thread(target=start_server_process, daemon=True).start()
     threading.Thread(target=monitor_server, daemon=True).start()
     Gtk.main()
 
+
+# ═══════════════════════════════════════════
+#  WINDOWS / macOS: pystray
+# ═══════════════════════════════════════════
+
+def run_pystray():
+    import pystray
+
+    icon_image = Image.open(ICON_PATH)
+
+    def on_open(icon, item):
+        webbrowser.open(URL)
+
+    def on_status_click(icon, item):
+        msgs = {"running": f"Server läuft auf Port {PORT}",
+                "starting": "Server startet...",
+                "error": "Server-Fehler! Logs prüfen."}
+        # Einfache Benachrichtigung
+        try:
+            icon.notify(msgs.get(status, "Unbekannt"), "ShinNexusn-Schlägerei")
+        except Exception:
+            pass
+
+    def on_quit_click(icon, item):
+        quit_app()
+        icon.stop()
+
+    icon = pystray.Icon(
+        "shinnexus",
+        icon_image,
+        "ShinNexusn-Schlägerei",
+        menu=pystray.Menu(
+            pystray.MenuItem("ShinNexus öffnen", on_open, default=True),
+            pystray.MenuItem("Status", on_status_click),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Beenden", on_quit_click),
+        )
+    )
+
+    def startup():
+        start_server_process()
+
+    threading.Thread(target=startup, daemon=True).start()
+    threading.Thread(target=monitor_server, daemon=True).start()
+    icon.run()
+
+
+# ═══════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════
+
 if __name__ == "__main__":
-    main()
+    if IS_LINUX:
+        try:
+            run_linux()
+        except Exception:
+            # Fallback auf pystray wenn AppIndicator nicht verfügbar
+            run_pystray()
+    else:
+        run_pystray()

@@ -48,12 +48,44 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install build tools
+        run: |
+          choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+
+      - name: Build liboqs from source
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch main https://github.com/open-quantum-safe/liboqs.git
+          cd liboqs; mkdir build; cd build
+          cmake -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE/liboqs-install" ..
+          cmake --build . --config Release
+          cmake --install . --config Release
+          cd $env:GITHUB_WORKSPACE
+
       - name: Create Windows Installer
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path "installer-build" -Force
+          # Embedded Python
+          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip" -OutFile "python-embed.zip"
+          Expand-Archive -Path "python-embed.zip" -DestinationPath "installer-build/python" -Force
+          (Get-Content "installer-build/python/python312._pth") -replace '#import site','import site' | Set-Content "installer-build/python/python312._pth"
+          # Install deps (ohne liboqs-python)
+          New-Item -ItemType Directory -Path "installer-build/python/Lib/site-packages" -Force
+          pip install pyotp qrcode Pillow edge-tts cryptography hdwallet bitcoin-utils pystray --target "installer-build/python/Lib/site-packages" --no-warn-script-location
+          # liboqs-python manuell
+          git clone --depth 1 https://github.com/open-quantum-safe/liboqs-python.git liboqs-py-src
+          Copy-Item -Path "liboqs-py-src/oqs" -Destination "installer-build/python/Lib/site-packages/oqs" -Recurse
+          Get-ChildItem "$env:GITHUB_WORKSPACE/liboqs-install" -Recurse -Filter "*.dll" | ForEach-Object {
+            Copy-Item $_.FullName -Destination "installer-build/python/Lib/site-packages/oqs/" -ErrorAction SilentlyContinue
+            Copy-Item $_.FullName -Destination "installer-build/python/" -ErrorAction SilentlyContinue
+          }
+          # Patch oqs.py
+          python installer/windows/patch_oqs.py "installer-build/python/Lib/site-packages/oqs"
+          # App files
           Copy-Item "ShinNexus.py","requirements.txt","start.sh","shinnexus-tray.py" -Destination "installer-build/" -ErrorAction SilentlyContinue
-          Copy-Item "*.png","*.webp","*.json" -Destination "installer-build/" -ErrorAction SilentlyContinue
+          Copy-Item "*.png","*.webp","*.json","*.ico" -Destination "installer-build/" -ErrorAction SilentlyContinue
+          Copy-Item "shinnexus.ico" -Destination "installer-build/" -ErrorAction SilentlyContinue
           Copy-Item "installer/windows/shinnexus-setup.iss" -Destination "." -ErrorAction SilentlyContinue
 
       - name: Build with Inno Setup
