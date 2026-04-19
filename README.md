@@ -79,7 +79,7 @@ Open `https://localhost:12345` — first account becomes Owner.
 
 Every ShinNexus instance verifies its own code integrity against the Bitcoin blockchain:
 
-1. `anchor.json` contains the TXID of the on-chain anchor
+1. `anchor-nexus.json` contains the TXID of the on-chain anchor
 2. At startup, the instance fetches the TX from mempool.space
 3. Compares the OP_RETURN hash with its own `sha256(ShinNexus.py)`
 4. **Match** = green footer "On-chain verified"
@@ -94,7 +94,8 @@ You can verify any instance yourself:
 
 ```
 ShinNexus.py          — Single-file application (~16k lines)
-anchor.json           — Bitcoin chain-of-trust certificate
+anchor-nexus.json     — Bitcoin chain-of-trust certificate
+anchor-kneipe.json    — Cross-program trust (Kneipe anchor)
 requirements.txt      — Python dependencies
 start.sh              — Service management (start/stop/restart/status/logs)
 ```
