@@ -98,34 +98,8 @@ jobs:
           name: ShinNexus-Windows-Setup
           path: Output/*.exe
 
-  build-macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Create macOS App Bundle
-        run: |
-          APP="ShinNexus.app"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp ShinNexus.py requirements.txt start.sh shinnexus-tray.py "$APP/Contents/Resources/" 2>/dev/null || true
-          cp *.png *.webp *.json "$APP/Contents/Resources/" 2>/dev/null || true
-          cp installer/macos/shinnexus-launcher.sh "$APP/Contents/MacOS/ShinNexus"
-          chmod +x "$APP/Contents/MacOS/ShinNexus"
-          cp installer/macos/Info.plist "$APP/Contents/"
-          hdiutil create -volname "ShinNexus" -srcfolder "$APP" -ov -format UDZO ShinNexus-macOS.dmg
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ShinNexus-macOS-DMG
-          path: ShinNexus-macOS.dmg
-
   release:
-    needs: [build-linux, build-windows, build-macos]
+    needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -137,5 +111,4 @@ jobs:
           files: |
             ShinNexus-Linux-AppImage/ShinNexus-x86_64.AppImage
             ShinNexus-Windows-Setup/*.exe
-            ShinNexus-macOS-DMG/ShinNexus-macOS.dmg
           generate_release_notes: true
