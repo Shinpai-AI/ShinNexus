@@ -33,25 +33,47 @@ Every version is anchored on the **Bitcoin blockchain** via OP_RETURN — tamper
 - **Recovery Seed** — 24-word BIP39 seed for account recovery.
 - **Self-Hosted** — Runs on any machine. No external dependencies except Python.
 
-## Quick Start
+## Installation
+
+### Linux (AppImage)
+
+Download `ShinNexus-x86_64.AppImage` from [Releases](https://github.com/Shinpai-AI/ShinNexus/releases), then:
 
 ```bash
-# Clone
+chmod +x ShinNexus-x86_64.AppImage
+./ShinNexus-x86_64.AppImage
+```
+
+Installs via Zenity dialog with folder selection. Creates desktop shortcut and system tray icon.
+
+### Windows (Installer)
+
+Download `ShinNexus-Setup.exe` from [Releases](https://github.com/Shinpai-AI/ShinNexus/releases) and run it. Includes embedded Python — no system Python needed. Creates Start Menu shortcut, desktop icon, and system tray. Configures Windows Firewall automatically.
+
+### Android (Termux)
+
+Install [Termux](https://github.com/termux/termux-app/releases) from GitHub (not Play Store!), then run:
+
+```bash
+curl -sL https://raw.githubusercontent.com/Shinpai-AI/ShinNexus/main/installer/android/install-termux.sh | bash
+```
+
+Start afterwards with: `bash ~/shinnexus-start.sh`
+
+**Note:** Requires a device with at least 4 GB RAM (Android 2020+). Older devices may fail to compile the cryptography package.
+
+### Manual (any platform)
+
+```bash
 git clone https://github.com/Shinpai-AI/ShinNexus.git
 cd ShinNexus
-
-# Create virtual environment
 python3 -m venv env
 source env/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Start
 python3 ShinNexus.py
 ```
 
-Open `http://localhost:12345` — first account becomes Owner.
+Open `https://localhost:12345` — first account becomes Owner.
 
 ## Bitcoin Verification
 
