@@ -33,53 +33,31 @@ Every version is anchored on the **Bitcoin blockchain** via OP_RETURN — tamper
 - **Recovery Seed** — 24-word BIP39 seed for account recovery.
 - **Self-Hosted** — Runs on any machine. No external dependencies except Python.
 
-## Installation
-
-### Linux (AppImage)
-
-Download `ShinNexus-x86_64.AppImage` from [Releases](https://github.com/Shinpai-AI/ShinNexus/releases), then:
+## Quick Start
 
 ```bash
-chmod +x ShinNexus-x86_64.AppImage
-./ShinNexus-x86_64.AppImage
-```
-
-Installs via Zenity dialog with folder selection. Creates desktop shortcut and system tray icon.
-
-### Windows (Installer)
-
-Download `ShinNexus-Setup.exe` from [Releases](https://github.com/Shinpai-AI/ShinNexus/releases) and run it. Includes embedded Python — no system Python needed. Creates Start Menu shortcut, desktop icon, and system tray. Configures Windows Firewall automatically.
-
-### Android (Termux)
-
-Install [Termux](https://github.com/termux/termux-app/releases) from GitHub (not Play Store!), then run:
-
-```bash
-curl -sL https://raw.githubusercontent.com/Shinpai-AI/ShinNexus/main/installer/android/install-termux.sh | bash
-```
-
-Start afterwards with: `bash ~/shinnexus-start.sh`
-
-**Note:** Requires a device with at least 4 GB RAM (Android 2020+). Older devices may fail to compile the cryptography package.
-
-### Manual (any platform)
-
-```bash
+# Clone
 git clone https://github.com/Shinpai-AI/ShinNexus.git
 cd ShinNexus
+
+# Create virtual environment
 python3 -m venv env
 source env/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
+
+# Start
 python3 ShinNexus.py
 ```
 
-Open `https://localhost:12345` — first account becomes Owner.
+Open `http://localhost:12345` — first account becomes Owner.
 
 ## Bitcoin Verification
 
 Every ShinNexus instance verifies its own code integrity against the Bitcoin blockchain:
 
-1. `anchor-nexus.json` contains the TXID of the on-chain anchor
+1. `anchor.json` contains the TXID of the on-chain anchor
 2. At startup, the instance fetches the TX from mempool.space
 3. Compares the OP_RETURN hash with its own `sha256(ShinNexus.py)`
 4. **Match** = green footer "On-chain verified"
@@ -94,8 +72,7 @@ You can verify any instance yourself:
 
 ```
 ShinNexus.py          — Single-file application (~16k lines)
-anchor-nexus.json     — Bitcoin chain-of-trust certificate
-anchor-kneipe.json    — Cross-program trust (Kneipe anchor)
+anchor.json           — Bitcoin chain-of-trust certificate
 requirements.txt      — Python dependencies
 start.sh              — Service management (start/stop/restart/status/logs)
 ```

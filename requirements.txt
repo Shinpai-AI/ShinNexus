@@ -6,6 +6,10 @@ cryptography>=42.0
 # liboqs-python — PQ Crypto (ML-DSA-65, ML-KEM-768) — PFLICHT (kein Fallback!)
 liboqs-python
 
+# Argon2id — KDF für Vault-KEK und Seed-Key — PFLICHT (kein SHA256-Fallback!)
+# Siehe PQ-Architektur.md „KDF-Härtung: Argon2id + Salzstreuer"
+argon2-cffi>=23.1
+
 # QR-Code für TOTP (Terminal + PNG)
 segno
 
@@ -18,6 +22,3 @@ stripe
 # Bitcoin — Blockchain-Verankerung (Version-Hash on-chain via OP_RETURN)
 hdwallet
 bitcoin-utils
-
-# Optional:
-# argon2-cffi — Besseres Passwort-Hashing (Fallback: PBKDF2)
