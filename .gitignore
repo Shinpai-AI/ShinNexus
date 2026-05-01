@@ -1,0 +1,27 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# Vault & sensitive data — NEVER commit
+vault/
+credentials/
+ShinNexus-Igni*/
+*.kek
+*.vault
+salt.bin
+
+# Logs & runtime
+logs/
+*.log
+.nexus.pid
+.server.pid
+
+# Virtualenv
+env/
+venv/
+
+# Backups (audit-snapshots, keine Quell-Wahrheit)
+*.bak
+*.bak-*
+ShinNexus.py.bak-*

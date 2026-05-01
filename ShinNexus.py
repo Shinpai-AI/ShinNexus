@@ -26,6 +26,7 @@ import time
 import getpass
 import base64
 import re
+import html as _html_escape
 from pathlib import Path
 from datetime import datetime, date
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -83,7 +84,7 @@ import signal
 #  KONSTANTEN & PFADE
 # ══════════════════════════════════════════════════════════════════════
 
-VERSION = "1.5.5"  # V1.5.5: Owner-Migration, Nexus-Dissolve, UI-Polish, Neon-LED, Bot-Counter, Member-Sort, Veriff-Toggle
+VERSION = "2.0.0"  # V1.5.5: Owner-Migration, Nexus-Dissolve, UI-Polish, Neon-LED, Bot-Counter, Member-Sort, Veriff-Toggle
 APP_NAME = "ShinNexus"
 DEFAULT_PORT = 12345
 
@@ -4320,17 +4321,16 @@ def _whitelist_check_remote_nexus(target_url: str, timeout: float = 5.0) -> tupl
         return (False, {}, ["Keine Ziel-URL angegeben"])
     if not target_url.startswith(("http://", "https://")):
         return (False, {}, ["URL muss mit http:// oder https:// beginnen"])
+    klasse, err = _classify_connection(target_url)
+    if klasse == 'REJECTED':
+        return (False, {}, [f"Ziel-URL nicht erlaubt: {err}"])
     try:
         import urllib.request
-        import ssl
         req = urllib.request.Request(
             f"{target_url}/api/chain/info",
             headers={"Accept": "application/json", "User-Agent": f"ShinNexus/{VERSION}"},
         )
-        ctx = ssl.create_default_context()
-        # Wir sind tolerant zu Self-Signed — Vertrauen kommt aus der Whitelist, nicht aus dem TLS-Cert
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx = _make_ssl_context(klasse)
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             raw = resp.read().decode("utf-8")
         data = json.loads(raw)
@@ -5337,15 +5337,52 @@ def _detect_local_ips() -> list:
     return sorted(ips)
 
 
+def _classify_connection(url):
+    """TLS-Architektur: klassifiziert Outbound-URL in eine von vier Welten.
+    Returns (klasse, err_or_none).
+    Klassen: DOMAIN_SECURE | LAN_HTTP | PUBLIC_IP_HTTP | REJECTED
+    """
+    from urllib.parse import urlparse
+    import ipaddress as _ipa
+    parsed = urlparse((url or '').rstrip('/'))
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        return 'REJECTED', 'Ungültige URL oder unbekanntes Schema'
+    host = parsed.hostname
+    try:
+        ip_obj = _ipa.ip_address(host)
+    except ValueError:
+        if parsed.scheme != 'https':
+            return 'REJECTED', 'Domain erfordert HTTPS, kein HTTP-Fallback'
+        return 'DOMAIN_SECURE', None
+    if parsed.scheme != 'http':
+        return 'REJECTED', 'HTTPS auf nackter IP nicht erlaubt — selbst-signiert verboten'
+    if ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local:
+        return 'LAN_HTTP', None
+    if ip_obj.is_multicast or ip_obj.is_reserved or ip_obj.is_unspecified:
+        return 'REJECTED', 'IP-Adresse nicht erlaubt'
+    return 'PUBLIC_IP_HTTP', None
+
+
+def _make_ssl_context(klasse):
+    """Liefert SSL-Kontext gemäß TLS-Architektur.
+    DOMAIN_SECURE → Default-Kontext (echte Cert-Verifikation, niemals aufweichen).
+    LAN_HTTP / PUBLIC_IP_HTTP / REJECTED → None (kein TLS).
+    """
+    if klasse == 'DOMAIN_SECURE':
+        import ssl as _ssl_local
+        return _ssl_local.create_default_context()
+    return None
+
+
 def _selftest_url(url: str, timeout: int = 6) -> bool:
     """Self-Test gegen /api/ping — prueft app-Name == ShinNexus.
     Braucht ThreadedServer (ThreadingMixIn) — sonst Deadlock beim Self-Request!
     """
     try:
-        import ssl as _ssl
-        ctx = _ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = _ssl.CERT_NONE
+        klasse, _err = _classify_connection(url)
+        if klasse == 'REJECTED':
+            return False
+        ctx = _make_ssl_context(klasse)
         req = urllib.request.Request(url.rstrip("/") + "/api/ping", method="GET")
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             if resp.status != 200:
@@ -5787,32 +5824,14 @@ def _obtain_acme_cert(domain: str, acme_email: str = "") -> tuple:
 
             stderr = (result.stderr or "") + (result.stdout or "")
 
-            # sudo ohne Passwort gescheitert? → sudoers-Regel anlegen
-            if "sudo: a password is required" in stderr or "sudo:" in stderr.lower() and "password" in stderr.lower():
-                _user = os.environ.get("USER", "")
-                if not _user:
-                    nexus_log("ACME: sudo braucht Passwort und User unbekannt!", "red")
-                    return None, None
-                _sudoers_rule = f"{_user} ALL=(ALL) NOPASSWD: {certbot_bin} *"
-                _sudoers_file = f"/etc/sudoers.d/shinnexus-certbot"
-                nexus_log("ACME: certbot braucht sudo-Rechte für Port 80", "yellow")
-                nexus_log("  Lege sudoers-Regel an (einmalig, braucht sudo-Passwort)...", "yellow")
-                try:
-                    _pw = getpass.getpass(f"  sudo-Passwort für {_user}: ")
-                    _setup_cmd = f"echo '{_sudoers_rule}' | sudo -S tee {_sudoers_file} && sudo chmod 440 {_sudoers_file}"
-                    _sr = subprocess.run(
-                        ["sudo", "-S", "bash", "-c", f"echo '{_sudoers_rule}' > {_sudoers_file} && chmod 440 {_sudoers_file}"],
-                        input=_pw + "\n", capture_output=True, text=True, timeout=10
-                    )
-                    if _sr.returncode == 0:
-                        nexus_log("ACME: sudoers-Regel angelegt! Wiederhole certbot...", "green")
-                        continue  # nochmal versuchen
-                    else:
-                        nexus_log(f"ACME: sudoers anlegen fehlgeschlagen: {_sr.stderr.strip()[:200]}", "red")
-                        return None, None
-                except Exception as _e:
-                    nexus_log(f"ACME: sudoers-Setup Fehler: {_e}", "red")
-                    return None, None
+            # Audit-Fix 2026-04-30 (Hasi-Diktat D): keine automatische Sudoers-Regel mehr.
+            # Wildcard-NOPASSWD für certbot war Local-Root-Falltür über --pre-hook/--post-hook.
+            # Linie: Caddy/nginx bleibt extern, ShinNexus terminiert kein TLS.
+            if "sudo: a password is required" in stderr or ("sudo:" in stderr.lower() and "password" in stderr.lower()):
+                nexus_log("ACME: certbot braucht root, ShinNexus richtet keine Sudoers-Regel ein.", "yellow")
+                nexus_log("  → Bitte Caddy oder nginx mit Let's-Encrypt extern davor schalten.", "yellow")
+                nexus_log("  → Doku: TLS-Architektur 'Caddy bleibt extern'.", "yellow")
+                return None, None
 
             if any(e.lower() in stderr.lower() for e in _RATE_ERRORS):
                 nexus_log(f"ACME: {pname} Rate-Limit → sperre Provider!", "yellow")
@@ -5916,7 +5935,7 @@ class NexusHandler(BaseHTTPRequestHandler):
         """BaseHTTPRequestHandler-Logging unterdrücken."""
         pass
 
-    def _send_json(self, data: dict, status: int = 200):
+    def _send_json(self, data: dict, status: int = 200, extra_headers=None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -5924,8 +5943,34 @@ class NexusHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        if extra_headers:
+            for k, v in extra_headers:
+                self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    def _session_cookie_header(self, token: str, max_age: int = 86400 * 7):
+        """Set-Cookie-Header für nexus_session mit HttpOnly + Secure + SameSite=Strict.
+        XSS-Hardening 2026-04-30: Cookie ist nicht mehr JS-lesbar."""
+        return ("Set-Cookie", f"nexus_session={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age}")
+
+    def _session_cookie_clear(self):
+        return ("Set-Cookie", "nexus_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0")
+
+    def _auth_token(self) -> str:
+        """Liefert den Session-Token aus X-Session-Token Header ODER aus dem Cookie.
+        XSS-Hardening: nach HttpOnly-Migration kann JS den Cookie nicht mehr lesen,
+        also kommt der Token entweder via X-Session-Token (Bot/CLI/Legacy) oder
+        per browser-auto-gesendetem Cookie."""
+        token = self.headers.get("X-Session-Token", "")
+        if token:
+            return token
+        cookie_header = self.headers.get("Cookie", "")
+        for part in cookie_header.split(";"):
+            part = part.strip()
+            if part.startswith("nexus_session="):
+                return part.split("=", 1)[1]
+        return ""
 
     def _read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length", 0))
@@ -5995,6 +6040,8 @@ class NexusHandler(BaseHTTPRequestHandler):
             self._handle_owner_igni_export()
         elif path == "/api/public-url/status":
             self._handle_public_url_status()
+        elif path == "/api/tls-status":
+            self._handle_tls_status()
         elif path == "/api/whitelist":
             self._handle_whitelist_get()
         elif path == "/api/public/bot-policy":
@@ -6282,6 +6329,8 @@ class NexusHandler(BaseHTTPRequestHandler):
             self._handle_tunnel_stop()
         elif path == "/api/auth/login":
             self._handle_auth_login()
+        elif path == "/api/auth/logout":
+            self._handle_auth_logout()
         elif path == "/api/auth/password":
             self._handle_password_change()
         elif path == "/api/auth/email":
@@ -6699,16 +6748,17 @@ class NexusHandler(BaseHTTPRequestHandler):
             "nexus_url": f"http://{self.config.get('host', '0.0.0.0')}:{self.config.get('port', DEFAULT_PORT)}",
         }, ensure_ascii=False).encode("utf-8")
 
+        _hj_klasse, _hj_err = _classify_connection(hive_url)
+        if _hj_klasse == 'REJECTED':
+            self._send_json({"error": f"Hive-URL nicht erlaubt: {_hj_err}"}, 400)
+            return
         try:
             req = urllib.request.Request(
                 f"{hive_url}/api/nexus/register",
                 data=register_payload,
                 headers={"Content-Type": "application/json; charset=utf-8"},
             )
-            import ssl as _ssl_hj
-            _hj_ctx = _ssl_hj.create_default_context()
-            _hj_ctx.check_hostname = False
-            _hj_ctx.verify_mode = _ssl_hj.CERT_NONE
+            _hj_ctx = _make_ssl_context(_hj_klasse)
             with urllib.request.urlopen(req, timeout=15, context=_hj_ctx) as resp:
                 result = json.loads(resp.read())
 
@@ -7230,7 +7280,19 @@ class NexusHandler(BaseHTTPRequestHandler):
             email_s = src.get("email", "")
             if email_s:
                 response["email"] = email_s
-        self._send_json(response)
+        # XSS-Hardening 2026-04-30: HttpOnly-Cookie für Web-Clients setzen.
+        # Bot/CLI-Clients nutzen weiter X-Session-Token aus dem JSON.
+        self._send_json(response, extra_headers=[self._session_cookie_header(session["token"])])
+
+    # ── Handler: Logout (Cookie löschen + Session invalidieren) ──
+    def _handle_auth_logout(self):
+        """POST /api/auth/logout — Session-Cookie löschen + Server-Session invalidieren.
+        Akzeptiert auch unauthentifizierte Aufrufe (idempotent)."""
+        token = self._auth_token()
+        if token and token in _auth_sessions:
+            del _auth_sessions[token]
+            nexus_log("Auth-Logout — Session invalidiert", "blue")
+        self._send_json({"ok": True}, extra_headers=[self._session_cookie_clear()])
 
     # ── Handler: Password Change (auth-basiert — Owner UND User) ──
     def _handle_password_change(self):
@@ -7498,7 +7560,7 @@ class NexusHandler(BaseHTTPRequestHandler):
                         "message": "Owner erstellt + 2FA aktiv!",
                         "shinpai_id": _identity["shinpai_id"],
                         "session_token": token,
-                    })
+                    }, extra_headers=[self._session_cookie_header(token)] if token else None)
                 else:
                     self._send_json({"error": "Falscher 2FA-Code"}, 401)
                 return
@@ -7823,6 +7885,11 @@ class NexusHandler(BaseHTTPRequestHandler):
         if result.get("ok"):
             # Schöne HTML-Seite statt JSON
             fm = result
+            # XSS-Hardening 2026-04-30: Alle attacker-controlled Felder durch html.escape
+            _esc_sender_name = _html_escape.escape(str(fm.get('sender_name', '')), quote=True)
+            _esc_sender_id = _html_escape.escape(str(fm.get('sender_id', '')), quote=True)
+            _esc_text = _html_escape.escape(str(fm.get('text', '')), quote=True)
+            _esc_hash = _html_escape.escape(str(fm.get('hash', ''))[:32], quote=True)
             burned_html = '<div style="color:#e55;font-size:14px;margin-top:15px;">🔥 Diese Nachricht wurde verbrannt und ist nicht mehr abrufbar.</div>' if fm.get("burned") else ''
             remaining = fm.get("remaining_seconds", 0)
             if remaining > 86400:
@@ -7842,9 +7909,9 @@ class NexusHandler(BaseHTTPRequestHandler):
                 <div style="color:#556677;font-size:11px;letter-spacing:2px;">VERIFIZIERT · VERSCHLÜSSELT · VERGÄNGLICH</div>
               </div>
               <div style="background:#0d1117;border:1px solid #2a1a0a;border-radius:10px;padding:20px;margin-bottom:15px;">
-                <div style="font-size:12px;color:#887755;margin-bottom:5px;">Von: <strong style="color:#e08040;">{fm['sender_name']}</strong></div>
-                <div style="font-size:10px;color:#556677;margin-bottom:15px;">Shinpai-ID: <code style="color:#7ab8e0;">{fm['sender_id']}</code></div>
-                <div style="font-size:15px;color:#e0d8c8;line-height:1.6;white-space:pre-wrap;">{fm['text']}</div>
+                <div style="font-size:12px;color:#887755;margin-bottom:5px;">Von: <strong style="color:#e08040;">{_esc_sender_name}</strong></div>
+                <div style="font-size:10px;color:#556677;margin-bottom:15px;">Shinpai-ID: <code style="color:#7ab8e0;">{_esc_sender_id}</code></div>
+                <div style="font-size:15px;color:#e0d8c8;line-height:1.6;white-space:pre-wrap;">{_esc_text}</div>
               </div>
               <div style="background:#0d1117;border-left:3px solid #e08040;padding:12px;border-radius:0 8px 8px 0;margin-bottom:15px;">
                 <div style="font-size:11px;color:#887755;">
@@ -7853,7 +7920,7 @@ class NexusHandler(BaseHTTPRequestHandler):
                   {'✅ PQ-Signiert' if fm['verified'] else '⚠️ Unsigniert'}
                 </div>
               </div>
-              <div style="font-size:9px;color:#334455;margin-bottom:5px;">Hash: <code>{fm['hash'][:32]}...</code></div>
+              <div style="font-size:9px;color:#334455;margin-bottom:5px;">Hash: <code>{_esc_hash}...</code></div>
               {burned_html}
               <hr style="border:none;border-top:1px solid #1a1a1a;margin:20px 0;">
               <div style="text-align:center;font-size:11px;color:#334455;">
@@ -7862,20 +7929,24 @@ class NexusHandler(BaseHTTPRequestHandler):
             </div></body></html>"""
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            # Defense-in-Depth: CSP verbietet alle externen Scripts/Resources
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'none'; style-src 'unsafe-inline'")
             self.end_headers()
             self.wfile.write(html.encode("utf-8"))
         else:
             # Verbrannt oder nicht gefunden → Feuer-Seite
+            _esc_err = _html_escape.escape(str(result.get('error', 'Diese Firemail existiert nicht mehr.')), quote=True)
             html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
             <title>🔥 Verbrannt — ShinNexus</title></head><body style="margin:0;background:#0a0a0a;color:#e0d8c8;font-family:Georgia,serif;">
             <div style="max-width:400px;margin:80px auto;text-align:center;padding:30px;">
               <div style="font-size:64px;">🔥</div>
               <h1 style="color:#e08040;font-size:20px;">Verbrannt</h1>
-              <p style="color:#887755;font-size:14px;">{result.get('error', 'Diese Firemail existiert nicht mehr.')}</p>
+              <p style="color:#887755;font-size:14px;">{_esc_err}</p>
               <p style="color:#334455;font-size:11px;margin-top:30px;">ShinNexus — Ist einfach passiert. 🐉</p>
             </div></body></html>"""
             self.send_response(410)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'none'; style-src 'unsafe-inline'")
             self.end_headers()
             self.wfile.write(html.encode("utf-8"))
 
@@ -8563,7 +8634,7 @@ class NexusHandler(BaseHTTPRequestHandler):
         _friends_data.pop(sid, None)
         _save_users()
         # Session invalidieren
-        token = self.headers.get("X-Session-Token", "")
+        token = self._auth_token()
         if token in _auth_sessions:
             del _auth_sessions[token]
         nexus_log(f"🗑️ ACCOUNT DELETED: {username} ({sid}){' [Perso→Blacklist 90d]' if has_perso else ''}", "yellow")
@@ -8798,7 +8869,7 @@ class NexusHandler(BaseHTTPRequestHandler):
             "shinpai_id": sid,
             "message": "Seed akzeptiert. Du bist im Reset-Modus — PW, 2FA oder Email innerhalb 7 Tagen erneuern.",
             "pw_reset_pending": True,
-        })
+        }, extra_headers=[self._session_cookie_header(token)] if token else None)
 
     def _handle_pw_reset_set(self):
         """POST /api/auth/pw-reset-set — Neues Passwort setzen im Reset-Mode.
@@ -9032,10 +9103,11 @@ class NexusHandler(BaseHTTPRequestHandler):
     # ── Friends & DM Handlers ────────────────────────────────────
 
     def _require_auth(self) -> dict | None:
-        """Auth-Session aus Token validieren. Gibt Session oder None (+ sendet 401)."""
-        token = self.headers.get("X-Session-Token", "")
+        """Auth-Session aus Token validieren. Gibt Session oder None (+ sendet 401).
+        Token-Quellen: X-Session-Token Header, HttpOnly-Cookie, oder Query-Param."""
+        token = self._auth_token()
         if not token:
-            # Fallback: Query-Param
+            # Fallback: Query-Param (für CLI/Tests)
             qs = parse_qs(urlparse(self.path).query)
             token = qs.get("token", [""])[0]
         if not token:
@@ -9829,17 +9901,19 @@ class NexusHandler(BaseHTTPRequestHandler):
         if not target_url or not target_url.startswith(("http://", "https://")):
             self._send_json({"error": "Gültige URL erforderlich (https://...)"}, 400)
             return
+        # TLS-Klassifikation + SSRF-Guard (Body-returning Endpoint)
+        klasse, err = _classify_connection(target_url)
+        if klasse == 'REJECTED':
+            self._send_json({"error": f"Ziel-URL nicht erlaubt: {err}"}, 400)
+            return
         # Fremde Whitelist abrufen
         try:
             import urllib.request
-            import ssl
             req = urllib.request.Request(
                 f"{target_url}/api/whitelist",
                 headers={"Accept": "application/json", "User-Agent": f"ShinNexus/{VERSION}"},
             )
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+            ctx = _make_ssl_context(klasse)
             with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
                 remote = json.loads(resp.read().decode("utf-8"))
         except Exception as e:
@@ -12125,12 +12199,13 @@ if(vl>=3){{
         if my_url and source_url.rstrip("/") == my_url:
             _fail("Quelle und Ziel sind derselbe Nexus", 400)
             return
-        # 1. Bundle vom Source abholen
+        # 1. Bundle vom Source abholen — TLS-Architektur
+        _mig_klasse, _mig_err = _classify_connection(source_url)
+        if _mig_klasse == 'REJECTED':
+            _fail(f"Source-URL nicht erlaubt: {_mig_err}", 400)
+            return
         try:
-            import ssl as _ssl
-            ctx = _ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = _ssl.CERT_NONE
+            ctx = _make_ssl_context(_mig_klasse)
             body = json.dumps({"token": token, "transport_key": transport_key}).encode("utf-8")
             req = urllib.request.Request(
                 source_url + "/api/migrate/bundle",
@@ -12414,7 +12489,7 @@ if(vl>=3){{
             state = dict(_network_state)
         # Auth optional — für Owner-Detail
         session = None
-        token = self.headers.get("X-Session-Token", "")
+        token = self._auth_token()
         if not token:
             token = (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
         if token:
@@ -12438,6 +12513,38 @@ if(vl>=3){{
                     "last_check": state.get("last_check", 0),
                 },
             })
+
+    def _handle_tls_status(self):
+        """GET /api/tls-status?url=URL — TLS-Klassifikation für eine URL.
+        Ohne url-Param: klassifiziert die gespeicherte public_url.
+        Auth: Owner-Session.
+        """
+        if not self._owner_only_session():
+            return
+        cfg = load_config()
+        qs = parse_qs(urlparse(self.path).query)
+        target_url = (qs.get("url", [""])[0] or "").strip().rstrip("/")
+        if not target_url:
+            target_url = (cfg.get("public_url") or "").strip().rstrip("/")
+        if not target_url:
+            self._send_json({"error": "Keine URL konfiguriert"}, 400)
+            return
+        klasse, err = _classify_connection(target_url)
+        if klasse == "DOMAIN_SECURE":
+            badge, tooltip, warning = "🔒", "Verbindung verschlüsselt verifiziert", None
+        elif klasse == "LAN_HTTP":
+            badge, tooltip, warning = "🏠", "Lokales Netzwerk — kein TLS nötig", None
+        elif klasse == "PUBLIC_IP_HTTP":
+            badge, tooltip, warning = "⚠", "Public-IP ohne Domain — Daten gehen unverschlüsselt durchs Internet.", "unverschlüsselt"
+        else:
+            badge, tooltip, warning = "❌", err or "URL abgelehnt", err
+        self._send_json({
+            "url": target_url,
+            "klasse": klasse,
+            "badge": badge,
+            "tooltip": tooltip,
+            "warning": warning,
+        })
 
     def _handle_public_url_check(self):
         """POST /api/public-url/check — Full-Check oder URL-specific (Owner only).
@@ -12968,6 +13075,9 @@ if(vl>=3){{
               <div id="share-banner-dash" style="display:none;max-width:420px;margin:12px auto 8px;font-size:12px;color:#556677;text-align:center;">
                 <div style="margin-bottom:3px;font-style:italic;">Deine Nexus-Adresse:</div>
                 <div style="display:flex;gap:6px;align-items:center;justify-content:center;">
+                  <span id="share-warn-dash" title="Public-IP ohne Domain — Daten gehen unverschlüsselt durchs Internet." style="display:none;color:#7ab8e0;align-items:center;">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+                  </span>
                   <span id="share-url-dash" style="font-family:monospace;color:#7ab8e0;font-size:13px;letter-spacing:0.3px;"></span>
                   <button id="btn-copy-share-dash" title="Kopieren" style="background:transparent;border:0;color:#7ab8e0;cursor:pointer;padding:2px 4px;display:inline-flex;align-items:center;">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
@@ -13628,6 +13738,9 @@ if(vl>=3){{
             <div id="share-banner" style="display:none;max-width:420px;margin:8px auto;font-size:12px;color:#556677;text-align:center;">
               <div style="margin-bottom:3px;font-style:italic;">Deine Nexus-Adresse:</div>
               <div style="display:flex;gap:6px;align-items:center;justify-content:center;">
+                <span id="share-warn" title="Public-IP ohne Domain — Daten gehen unverschlüsselt durchs Internet." style="display:none;color:#7ab8e0;align-items:center;">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+                </span>
                 <span id="share-url" style="font-family:monospace;color:#7ab8e0;font-size:13px;letter-spacing:0.3px;"></span>
                 <button id="btn-copy-share" title="Kopieren" style="background:transparent;border:0;color:#7ab8e0;cursor:pointer;padding:2px 4px;display:inline-flex;align-items:center;">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
@@ -13741,6 +13854,9 @@ if(vl>=3){{
                 <div id="share-banner-claim" style="display:none;max-width:320px;margin:0 auto 10px;font-size:12px;color:#556677;text-align:center;">
                   <div style="margin-bottom:3px;font-style:italic;">Deine Nexus-Adresse:</div>
                   <div style="display:flex;gap:6px;align-items:center;justify-content:center;">
+                    <span id="share-warn-claim" title="Public-IP ohne Domain — Daten gehen unverschlüsselt durchs Internet." style="display:none;color:#7ab8e0;align-items:center;">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+                    </span>
                     <span id="share-url-claim" style="font-family:monospace;color:#7ab8e0;font-size:13px;letter-spacing:0.3px;"></span>
                     <button id="btn-copy-claim" title="Kopieren" style="background:transparent;border:0;color:#7ab8e0;cursor:pointer;padding:2px 4px;display:inline-flex;align-items:center;">
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
@@ -13763,6 +13879,9 @@ if(vl>=3){{
                 <div id="share-banner-migrate" style="display:none;max-width:320px;margin:0 auto 10px;font-size:12px;color:#556677;text-align:center;">
                   <div style="margin-bottom:3px;font-style:italic;">Adresse dieses Nexus (als Ziel eintragen):</div>
                   <div style="display:flex;gap:6px;align-items:center;justify-content:center;">
+                    <span id="share-warn-migrate" title="Public-IP ohne Domain — Daten gehen unverschlüsselt durchs Internet." style="display:none;color:#7ab8e0;align-items:center;">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+                    </span>
                     <span id="share-url-migrate" style="font-family:monospace;color:#7ab8e0;font-size:13px;letter-spacing:0.3px;"></span>
                     <button id="btn-copy-migrate" title="Kopieren" style="background:transparent;border:0;color:#7ab8e0;cursor:pointer;padding:2px 4px;display:inline-flex;align-items:center;">
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
@@ -13950,7 +14069,7 @@ async function doLogin() {{
       err.style.display = 'none';
       setTimeout(() => el('totp').focus(), 100);
     }} else if (d.authenticated) {{
-      document.cookie = 'nexus_session=' + d.session_token + '; path=/; SameSite=Strict; Secure';
+      // XSS-Hardening 2026-04-30: Cookie wird vom Server per HttpOnly Set-Cookie gesetzt.
       location.href = '/';
     }} else {{
       err.textContent = d.error || 'Login fehlgeschlagen'; err.style.display = 'block';
@@ -13974,7 +14093,7 @@ async function doLogin2FA() {{
     }});
     const d = await r.json();
     if (d.authenticated) {{
-      document.cookie = 'nexus_session=' + d.session_token + '; path=/; SameSite=Strict; Secure';
+      // XSS-Hardening 2026-04-30: Cookie kommt vom Server per HttpOnly.
       location.href = '/';
     }} else {{
       err.textContent = d.error || '2FA fehlgeschlagen'; err.style.display = 'block';
@@ -13983,8 +14102,11 @@ async function doLogin2FA() {{
     err.textContent = 'Verbindungsfehler'; err.style.display = 'block';
   }}
 }}
-function doLogout() {{
-  document.cookie = 'nexus_session=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+async function doLogout() {{
+  // XSS-Hardening 2026-04-30: Cookie ist HttpOnly → Server muss ihn löschen.
+  try {{
+    await fetch('/api/auth/logout', {{method: 'POST', credentials: 'same-origin'}});
+  }} catch(e) {{}}
   location.href = '/?logout=1';
 }}
 function showSection(id) {{
@@ -14250,6 +14372,38 @@ async function _doShareCopy(btnId, urlElId) {{
     prompt('Kopieren:', url);
   }}
 }}
+function _classifyUrl(url) {{
+  try {{
+    const u = new URL(url);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return 'REJECTED';
+    let host = u.hostname.replace(/^\\[|\\]$/g, '');
+    if (host === 'localhost') return 'LAN_HTTP';
+    const isIP4 = /^(\\d{{1,3}}\\.){{3}}\\d{{1,3}}$/.test(host);
+    const isIP6 = host.indexOf(':') !== -1;
+    if (isIP4) {{
+      if (u.protocol !== 'http:') return 'REJECTED';
+      const p = host.split('.').map(n => parseInt(n,10));
+      if (p[0] === 127) return 'LAN_HTTP';
+      if (p[0] === 10) return 'LAN_HTTP';
+      if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return 'LAN_HTTP';
+      if (p[0] === 192 && p[1] === 168) return 'LAN_HTTP';
+      if (p[0] === 169 && p[1] === 254) return 'LAN_HTTP';
+      return 'PUBLIC_IP_HTTP';
+    }}
+    if (isIP6) {{
+      const lo = host.toLowerCase();
+      if (lo === '::1' || lo.startsWith('fe80') || lo.startsWith('fc') || lo.startsWith('fd')) return 'LAN_HTTP';
+      if (u.protocol !== 'http:') return 'REJECTED';
+      return 'PUBLIC_IP_HTTP';
+    }}
+    if (u.protocol !== 'https:') return 'REJECTED';
+    return 'DOMAIN_SECURE';
+  }} catch (e) {{ return 'REJECTED'; }}
+}}
+function _toggleWarn(id, url) {{
+  const el = document.getElementById(id);
+  if (el) el.style.display = (_classifyUrl(url) === 'PUBLIC_IP_HTTP') ? 'inline-flex' : 'none';
+}}
 async function updateShareBanner() {{
   // Alle Banner gleichzeitig updaten — identische Daten
   const banner1 = document.getElementById('share-banner');
@@ -14297,6 +14451,7 @@ async function updateShareBanner() {{
       const hintEl = document.getElementById('share-hint');
       if (urlEl) {{ urlEl.textContent = url; urlEl.dataset.url = url; }}
       if (hintEl) hintEl.textContent = hint;
+      _toggleWarn('share-warn', url);
       banner1.style.display = 'block';
     }}
     // Banner 2 (Dashboard)
@@ -14305,6 +14460,7 @@ async function updateShareBanner() {{
       const hintEl = document.getElementById('share-hint-dash');
       if (urlEl) {{ urlEl.textContent = url; urlEl.dataset.url = url; }}
       if (hintEl) hintEl.textContent = hint;
+      _toggleWarn('share-warn-dash', url);
       banner2.style.display = 'block';
     }}
     // Banner 3 (Claim — Owner-Einrichtung)
@@ -14313,6 +14469,7 @@ async function updateShareBanner() {{
       const hintEl = document.getElementById('share-hint-claim');
       if (urlEl) {{ urlEl.textContent = url; urlEl.dataset.url = url; }}
       if (hintEl) hintEl.textContent = hint;
+      _toggleWarn('share-warn-claim', url);
       banner3.style.display = 'block';
     }}
     // Banner 4 (Claim-Migration)
@@ -14321,6 +14478,7 @@ async function updateShareBanner() {{
       const hintEl = document.getElementById('share-hint-migrate');
       if (urlEl) {{ urlEl.textContent = url; urlEl.dataset.url = url; }}
       if (hintEl) hintEl.textContent = hint;
+      _toggleWarn('share-warn-migrate', url);
       banner4.style.display = 'block';
     }}
   }} catch (e) {{
@@ -15699,7 +15857,7 @@ async function doSeedUnlock() {{
     const r = await fetch('/api/auth/seed-unlock', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{username, seed_phrase:seed}})}});
     const d = await r.json();
     if (d.ok && d.session_token) {{
-      document.cookie = 'nexus_session=' + d.session_token + '; path=/; SameSite=Strict; Secure';
+      // XSS-Hardening 2026-04-30: Cookie kommt vom Server per HttpOnly.
       msg.innerHTML = '✅ Seed akzeptiert — leite zum Reset-Dashboard weiter…';
       msg.style.color = '#4a4';
       setTimeout(() => {{ location.href = '/'; }}, 1200);
@@ -15901,7 +16059,8 @@ async function doAccountDeleteSelf() {{
     const d = await r.json();
     if (d.ok) {{
       alert('✅ Account gelöscht.');
-      document.cookie = 'nexus_session=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+      // XSS-Hardening 2026-04-30: HttpOnly-Cookie via Logout-Endpoint löschen.
+      try {{ await fetch('/api/auth/logout', {{method:'POST', credentials:'same-origin'}}); }} catch(e) {{}}
       location.href = '/?logout=1';
     }} else {{
       alert('Fehler: ' + (d.error || 'unbekannt'));
@@ -16378,7 +16537,7 @@ document.addEventListener('keydown', e => {{
     if (d.error) {{ msg.textContent = d.error; msg.style.color = '#e55'; return; }}
     if (d.step === 'done') {{
       msg.textContent = '✅ Owner erstellt + 2FA aktiv!'; msg.style.color = '#4a4';
-      if (d.session_token) document.cookie = 'nexus_session=' + d.session_token + '; path=/; SameSite=Strict; Secure';
+      // XSS-Hardening 2026-04-30: Cookie kommt vom Server per HttpOnly.
       setTimeout(() => location.reload(), 2000);
     }}
   }};
@@ -17058,13 +17217,14 @@ def _print_qr_terminal(uri: str):
 
 
 def _nexus_request(url: str, data: dict = None, method: str = "GET") -> dict | None:
-    """HTTP-Request an einen ShinNexus-Server (für Client-Modus)."""
+    """HTTP-Request an einen ShinNexus-Server (für Client-Modus). TLS-Architektur."""
     import urllib.request
     try:
-        # SSL-Context: Self-Signed akzeptieren
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        klasse, err = _classify_connection(url)
+        if klasse == 'REJECTED':
+            nexus_log(f"Nexus-URL abgelehnt: {err}", "red")
+            return None
+        ctx = _make_ssl_context(klasse)
 
         if data is not None:
             body = json.dumps(data).encode("utf-8")
