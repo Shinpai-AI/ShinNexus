@@ -13931,6 +13931,14 @@ if(vl>=3){{
         except Exception:
             _cur_hash = ""
         _short_hash = _cur_hash[:16] if _cur_hash else "—"
+        # Schmetterling-Wasserzeichen Gate: nur sichtbar wenn Server-Code AUTHENTISCH verankert ist
+        # (Bitcoin-TXID gesetzt + Hash matcht + nicht revoked) — sonst kein Vertrauens-Indikator
+        _butterfly_verified = (
+            bool(_anchor.get("txid"))
+            and bool(_cur_hash)
+            and _cur_hash == _anchor.get("code_hash", "")
+            and not _anchor.get("revoked")
+        )
         # Click-to-Copy: Version + voller Hash (+ TXID wenn verankert und nicht widerrufen)
         # für direkten Smart-Paste in die Whitelist
         _copy_text = f"ShinNexus v{VERSION} · {_cur_hash}" if _cur_hash else f"ShinNexus v{VERSION}"
@@ -17000,44 +17008,396 @@ async function doVerifyReset() {{
 <div style="text-align:center;margin-top:30px;padding:10px;font-size:9px;color:#3a3a4a;"></div>
 <canvas id="butterfly-canvas" style="position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:9999;"></canvas>
 <script>
-// 🦋 ShinNexus Wasserzeichen — Schmetterling V12
-// Fliegt NUR wenn Lizenz aktiv (license_company gesetzt)
-var _hasLicense = {str(bool(_lcompany)).lower()};
-if (!_hasLicense) {{ document.getElementById('butterfly-canvas').style.display = 'none'; }}
+// 🦋 ShinNexus Wasserzeichen — Schmetterling V13 (echte Silhouette + ShinShare-Palette + Sternenstaub-Schweif)
+// Fliegt NUR wenn der Server-Code AUTHENTISCH auf der Blockchain verankert ist (Vertrauens-Türsteher)
+// Kein Schmetterling = kein Vertrauen → sofortiger visueller Alarm für den User
+var _butterflyVerified = {str(_butterfly_verified).lower()};
+if (!_butterflyVerified) {{ document.getElementById('butterfly-canvas').style.display = 'none'; }}
 (function(){{
-  const cvs=document.getElementById('butterfly-canvas');if(!cvs)return;
-  const ctx=cvs.getContext('2d');
-  cvs.width=window.innerWidth;cvs.height=window.innerHeight;
-  window.onresize=()=>{{cvs.width=window.innerWidth;cvs.height=window.innerHeight;}};
-  // Seed aus Code-Hash (vom Server injiziert)
-  let _rs={code_seed};function sR(){{_rs=(_rs*9301+49297)%233280;return _rs/233280;}}
-  // Prozentuale Koordinaten → gleicher Flug auf jedem Gerät
-  function randEdge(){{const e=Math.floor(sR()*4);switch(e){{case 0:return{{x:sR(),y:-0.03}};case 1:return{{x:1.03,y:sR()}};case 2:return{{x:sR(),y:1.03}};default:return{{x:-0.03,y:sR()}};}}}}
-  let startX,startY,endX,endY,swA,swF,swP,fStart=0,pEnd=0;const trail=[];let _lastCycle=-1;
-  function newF(){{const s=randEdge();let e=randEdge();startX=s.x;startY=s.y;endX=e.x;endY=e.y;swA=0.04+sR()*0.08;swF=1.5+sR()*2;swP=sR()*Math.PI*2;fStart=Date.now();pEnd=0;}}
-  newF();
-  // Alles in Prozent (0-1), erst beim Zeichnen auf Pixel skalieren
-  function getP(t){{const ea=0.5-0.5*Math.cos(t*Math.PI);const bx=startX+(endX-startX)*ea;const by=startY+(endY-startY)*ea;const dx=endX-startX,dy=endY-startY,ln=Math.sqrt(dx*dx+dy*dy)||1;const nx=-dy/ln,ny=dx/ln;const mf=Math.sin(t*Math.PI);const sw=Math.sin(ea*Math.PI*swF+swP)*swA*mf;return{{x:bx+nx*sw,y:by+ny*sw}};}}
-  function drawB(x,y,wa,sz){{ctx.save();ctx.translate(x,y);const w=wa*1.2,S=sz*1.3;
-    function wing(side,top){{const s=side==='L'?-1:1;ctx.save();ctx.scale(s,1);if(top){{const wI=w*0.3,wO=w*1.0,mx=S*0.5,my=-S*0.45+wI*S*0.12,tx=S*0.95,ty=my-S*0.25+wO*S*0.2;ctx.beginPath();ctx.moveTo(0,-S*0.05);ctx.bezierCurveTo(S*0.2,-S*0.4+wI*S*0.05,S*0.35,my-S*0.2,mx,my-S*0.05);ctx.bezierCurveTo(S*0.65,my-S*0.15+wO*S*0.05,S*0.85,ty-S*0.05,tx,ty);ctx.quadraticCurveTo(tx+S*0.02,ty+S*0.12,tx-S*0.1,ty+S*0.18);ctx.bezierCurveTo(S*0.7,my+S*0.25+wO*S*0.08,S*0.55,my+S*0.3,mx-S*0.05,my+S*0.25);ctx.bezierCurveTo(S*0.3,my+S*0.2,S*0.15,S*0.05,0,S*0.1);ctx.closePath();const g=ctx.createRadialGradient(mx,my,S*0.05,mx,my,S*0.55);g.addColorStop(0,'hsla(280,80%,55%,0.85)');g.addColorStop(0.45,'hsla(320,75%,50%,0.75)');g.addColorStop(1,'hsla(25,85%,55%,0.65)');ctx.fillStyle=g;ctx.fill();ctx.strokeStyle='hsla(280,55%,65%,0.5)';ctx.lineWidth=0.8;ctx.stroke();ctx.beginPath();ctx.arc(S*0.65,(my+ty)/2+S*0.05,S*0.08,0,Math.PI*2);ctx.fillStyle='hsla(40,80%,65%,0.5)';ctx.fill();ctx.beginPath();ctx.arc(S*0.65,(my+ty)/2+S*0.05,S*0.04,0,Math.PI*2);ctx.fillStyle='hsla(0,0%,95%,0.6)';ctx.fill();}}else{{const wL=w*0.4;ctx.beginPath();ctx.moveTo(0,S*0.02);ctx.bezierCurveTo(S*0.2,S*0.08,S*0.6,S*(0.2+wL*0.1),S*0.6,S*(0.4+wL*0.08));ctx.bezierCurveTo(S*0.55,S*(0.55+wL*0.05),S*0.3,S*0.5,S*0.15,S*0.35);ctx.bezierCurveTo(S*0.05,S*0.15,0,S*0.08,0,S*0.02);const g2=ctx.createRadialGradient(S*0.25,S*0.2,S*0.02,S*0.3,S*0.25,S*0.3);g2.addColorStop(0,'hsla(25,85%,55%,0.8)');g2.addColorStop(1,'hsla(340,75%,45%,0.65)');ctx.fillStyle=g2;ctx.fill();ctx.strokeStyle='hsla(280,60%,70%,0.5)';ctx.lineWidth=0.6;ctx.stroke();}}ctx.restore();}}
-    wing('L',false);wing('R',false);wing('L',true);wing('R',true);
-    for(let i=0;i<5;i++){{const cy=-S*0.08+i*S*0.05,r=S*(0.028-i*0.002);ctx.beginPath();ctx.ellipse(0,cy,r,r*1.3,0,0,Math.PI*2);ctx.fillStyle=`hsla(280,30%,${{20+i*3}}%,0.95)`;ctx.fill();}}
-    ctx.beginPath();ctx.arc(0,-S*0.12,S*0.035,0,Math.PI*2);ctx.fillStyle='hsla(280,35%,25%,0.95)';ctx.fill();
-    ctx.lineWidth=0.8;ctx.strokeStyle='hsla(280,40%,45%,0.8)';ctx.beginPath();ctx.moveTo(-S*0.01,-S*0.15);ctx.bezierCurveTo(-S*0.08,-S*0.3,-S*0.18,-S*0.38,-S*0.12,-S*0.42);ctx.stroke();ctx.beginPath();ctx.arc(-S*0.12,-S*0.42,S*0.015,0,Math.PI*2);ctx.fillStyle='hsla(280,50%,55%,0.9)';ctx.fill();ctx.beginPath();ctx.moveTo(S*0.01,-S*0.15);ctx.bezierCurveTo(S*0.08,-S*0.3,S*0.18,-S*0.38,S*0.12,-S*0.42);ctx.stroke();ctx.beginPath();ctx.arc(S*0.12,-S*0.42,S*0.015,0,Math.PI*2);ctx.fillStyle='hsla(280,50%,55%,0.9)';ctx.fill();ctx.restore();}}
-  function anim(){{ctx.clearRect(0,0,cvs.width,cvs.height);const now=Date.now();
-    // Absolute Zeit: 13s Zyklus (8s Flug + 5s Pause), synchron auf allen Geräten
-    const cycle=13000;
-    const phase=now%cycle;
-    if(phase>=8000){{ctx.clearRect(0,0,cvs.width,cvs.height);requestAnimationFrame(anim);return;}}
-    // Neuen Flug berechnen basierend auf Zyklus-Nummer (deterministisch!)
-    const cycleNum=Math.floor(now/cycle);
-    if(cycleNum!==_lastCycle){{_lastCycle=cycleNum;_rs={code_seed};for(let i=0;i<cycleNum%50;i++)sR();newF();trail.length=0;}}
-    const t=phase/8000,pt=getP(t),wa=Math.sin(now*0.004)*1.0;
-    const px=pt.x*cvs.width,py=pt.y*cvs.height;
-    trail.push({{x:px,y:py,age:0}});if(trail.length>25)trail.shift();
-    trail.forEach(p=>{{p.age++;const a=Math.max(0,1-p.age/25)*0.25;ctx.beginPath();ctx.arc(p.x,p.y,1.5,0,Math.PI*2);ctx.fillStyle=`hsla(280,70%,60%,${{a}})`;ctx.fill();}});
-    drawB(px,py,wa,12);requestAnimationFrame(anim);}}
-  anim();
+  const cvs = document.getElementById('butterfly-canvas');
+  if (!cvs) return;
+  const ctx = cvs.getContext('2d');
+  cvs.width = window.innerWidth;
+  cvs.height = window.innerHeight;
+  window.onresize = () => {{ cvs.width = window.innerWidth; cvs.height = window.innerHeight; }};
+
+  // === Hash vom Server (voller SHA-256) ===
+  const hash = "{_cur_hash}" || 'fc95a3521032a2a54c99ef60ed62d6af';
+
+  // === RNG (deterministisch aus Hash) ===
+  let _rs = 0;
+  function sR() {{ _rs = (_rs * 9301 + 49297) % 233280; return _rs / 233280; }}
+  function seedFromHash(h) {{ const sub = (h || 'fc95a352').substring(0, 8); return parseInt(sub, 16) || 1; }}
+  function hashByte(h, idx) {{ const sub = h.substring((idx * 2) % h.length, (idx * 2) % h.length + 2); return parseInt(sub || '00', 16); }}
+  function hashFloat(h, idx) {{ return hashByte(h, idx) / 255; }}
+
+  // === ShinShare-Farbpalette ===
+  const SHINSHARE_PALETTE = [285, 25, 220, 55, 175];
+  function pickHues(h) {{
+    const pool = [0, 1, 2, 3, 4]; const picks = [];
+    for (let i = 0; i < 3; i++) {{
+      const idx = hashByte(h, 35 + i) % pool.length;
+      picks.push(SHINSHARE_PALETTE[pool[idx]]);
+      pool.splice(idx, 1);
+    }}
+    return picks;
+  }}
+
+  // === Sternenstaub-Pattern ===
+  const TAIL_PATTERNS = {{
+    'dots':      ['dot','dot','dot'],
+    'stars':     ['star','star','star'],
+    'lines':     ['line','line','line'],
+    'dot-star':  ['dot','star'],
+    'dot-line':  ['dot','line'],
+    'star-line': ['star','line'],
+    'tri':       ['dot','star','line'],
+    'tri-mix':   ['dot','dot','star','line','star'],
+  }};
+  const TAIL_KEYS = Object.keys(TAIL_PATTERNS);
+
+  function getFormParams(h) {{
+    const tailIdx = hashByte(h, 30) % TAIL_KEYS.length;
+    const noTailRoll = hashFloat(h, 31) * hashFloat(h, 0);
+    const hasTailPattern = noTailRoll >= 0.0001;
+    return {{
+      sizeVar: 0.92 + hashFloat(h, 21) * 0.18,
+      forewingScale: 0.95 + hashFloat(h, 16) * 0.15,
+      hindwingScale: 0.92 + hashFloat(h, 17) * 0.16,
+      apexSharpness: 0.85 + hashFloat(h, 18) * 0.20,
+      hueShift: hashFloat(h, 23) * 30 - 15,
+      bodyTone: 0.85 + hashFloat(h, 20) * 0.25,
+      bandStrength: 0.4 + hashFloat(h, 22) * 0.35,
+      huePicks: pickHues(h),
+      breathSpeed: 0.0008 + hashFloat(h, 34) * 0.0014,
+      spotHue: hashFloat(h, 27) * 360,
+      spotSat: 70 + hashFloat(h, 28) * 30,
+      spotLit: 55 + hashFloat(h, 29) * 20,
+      tailPool: TAIL_PATTERNS[TAIL_KEYS[tailIdx]],
+      hasTailPattern,
+    }};
+  }}
+
+  function drawStar(cx, cy, rO, rI) {{
+    ctx.beginPath();
+    for (let s = 0; s < 10; s++) {{
+      const r = (s % 2 === 0) ? rO : rI;
+      const a = -Math.PI / 2 + s * Math.PI / 5;
+      const x = cx + Math.cos(a) * r;
+      const y = cy + Math.sin(a) * r;
+      if (s === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }}
+    ctx.closePath();
+  }}
+
+  // === Edge-Picker + Flugbahn ===
+  function randEdge() {{
+    const e = Math.floor(sR() * 4);
+    switch (e) {{
+      case 0: return {{ x: sR(), y: -0.05 }};
+      case 1: return {{ x: 1.05, y: sR() }};
+      case 2: return {{ x: sR(), y: 1.05 }};
+      default: return {{ x: -0.05, y: sR() }};
+    }}
+  }}
+
+  let startX, startY, endX, endY, swA, swF, swP;
+  let _lastCycle = -1;
+  let codeSeed = seedFromHash(hash);
+
+  function newFlight() {{
+    const s = randEdge(); const e = randEdge();
+    startX = s.x; startY = s.y;
+    endX = e.x; endY = e.y;
+    swA = 0.04 + sR() * 0.08;
+    swF = 1.5 + sR() * 2;
+    swP = sR() * Math.PI * 2;
+  }}
+
+  function getPos(t) {{
+    const ea = 0.5 - 0.5 * Math.cos(t * Math.PI);
+    const bx = startX + (endX - startX) * ea;
+    const by = startY + (endY - startY) * ea;
+    const dx = endX - startX, dy = endY - startY;
+    const ln = Math.sqrt(dx * dx + dy * dy) || 1;
+    const nx = -dy / ln, ny = dx / ln;
+    const mf = Math.sin(t * Math.PI);
+    const sw = Math.sin(ea * Math.PI * swF + swP) * swA * mf;
+    return {{ x: bx + nx * sw, y: by + ny * sw }};
+  }}
+
+  function getHeading(t) {{
+    const dt = 0.005;
+    const a = getPos(Math.max(0, t - dt));
+    const b = getPos(Math.min(1, t + dt));
+    return Math.atan2(b.y - a.y, b.x - a.x);
+  }}
+
+  // === Vorderflügel ===
+  function drawForewing(side, S, fp, lightMod) {{
+    const w = fp.forewingScale; const apex = fp.apexSharpness;
+    ctx.beginPath();
+    ctx.moveTo(0, -S * 0.05);
+    ctx.bezierCurveTo(S * 0.25, -S * 0.55, S * 0.65 * w, -S * 0.85 * apex, S * 0.95 * w, -S * 0.70 * apex);
+    ctx.quadraticCurveTo(S * 1.05 * w, -S * 0.55 * apex, S * 1.00 * w, -S * 0.40);
+    ctx.bezierCurveTo(S * 0.95 * w, -S * 0.20, S * 0.85 * w, -S * 0.05, S * 0.65 * w, S * 0.05);
+    ctx.bezierCurveTo(S * 0.40, S * 0.08, S * 0.15, S * 0.02, 0, S * 0.00);
+    ctx.closePath();
+    const wingHueShift = Math.sin(Date.now() * fp.breathSpeed) * 8;
+    const h0 = (fp.huePicks[0] + wingHueShift + 360) % 360;
+    const h1 = (fp.huePicks[1] + wingHueShift + 360) % 360;
+    const h2 = (fp.huePicks[2] + wingHueShift + 360) % 360;
+    const g = ctx.createLinearGradient(0, -S * 0.7, S * w, S * 0.05);
+    g.addColorStop(0,   `hsla(${{h0}}, 80%, ${{55 * lightMod}}%, ${{0.88 * lightMod}})`);
+    g.addColorStop(0.5, `hsla(${{h1}}, 82%, ${{58 * lightMod}}%, ${{0.88 * lightMod}})`);
+    g.addColorStop(1,   `hsla(${{h2}}, 85%, ${{60 * lightMod}}%, ${{0.85 * lightMod}})`);
+    ctx.fillStyle = g; ctx.fill();
+    ctx.save(); ctx.clip();
+    ctx.strokeStyle = `hsla(0, 0%, ${{94 * lightMod}}%, ${{0.85 * lightMod}})`;
+    ctx.lineWidth = S * 0.05;
+    ctx.beginPath();
+    ctx.moveTo(0, -S * 0.05);
+    ctx.bezierCurveTo(S * 0.25, -S * 0.55, S * 0.65 * w, -S * 0.85 * apex, S * 0.95 * w, -S * 0.70 * apex);
+    ctx.quadraticCurveTo(S * 1.05 * w, -S * 0.55 * apex, S * 1.00 * w, -S * 0.40);
+    ctx.bezierCurveTo(S * 0.95 * w, -S * 0.20, S * 0.85 * w, -S * 0.05, S * 0.65 * w, S * 0.05);
+    ctx.stroke(); ctx.restore();
+    ctx.strokeStyle = `hsla(28, 60%, ${{15 * lightMod}}%, ${{0.80 * lightMod}})`;
+    ctx.lineWidth = S * 0.012;
+    for (let v = 0; v < 4; v++) {{
+      const ang = -Math.PI * 0.5 + (v / 3) * Math.PI * 0.55;
+      const r1 = S * 0.20; const r2 = S * 0.85 * w;
+      ctx.beginPath();
+      ctx.moveTo(0, -S * 0.05);
+      ctx.quadraticCurveTo(Math.cos(ang) * r1 * 0.7, Math.sin(ang) * r1 * 0.7 - S * 0.08, Math.cos(ang) * r2, Math.sin(ang) * r2 - S * 0.05);
+      ctx.stroke();
+    }}
+    ctx.strokeStyle = `hsla(${{h2}}, 80%, ${{78 * lightMod}}%, ${{0.40 * fp.bandStrength * lightMod}})`;
+    ctx.lineWidth = S * 0.04;
+    ctx.beginPath();
+    ctx.moveTo(S * 0.30, -S * 0.50 * apex);
+    ctx.quadraticCurveTo(S * 0.55 * w, -S * 0.30, S * 0.70 * w, -S * 0.10);
+    ctx.stroke();
+    const glintGrad = ctx.createRadialGradient(S * 0.55 * w, -S * 0.45, 0, S * 0.55 * w, -S * 0.45, S * 0.45);
+    glintGrad.addColorStop(0, `rgba(255, 220, 140, ${{0.35 * lightMod}})`);
+    glintGrad.addColorStop(1, 'rgba(255, 220, 140, 0)');
+    ctx.fillStyle = glintGrad; ctx.fill();
+    const eyeX = S * 0.78 * w; const eyeY = -S * 0.45 * apex;
+    ctx.beginPath(); ctx.arc(eyeX, eyeY, S * 0.07, 0, Math.PI * 2);
+    ctx.fillStyle = `hsla(0, 0%, 8%, ${{0.85 * lightMod}})`; ctx.fill();
+    ctx.beginPath(); ctx.arc(eyeX, eyeY, S * 0.045, 0, Math.PI * 2);
+    ctx.fillStyle = `hsla(${{fp.spotHue}}, ${{fp.spotSat}}%, ${{fp.spotLit * lightMod}}%, 0.88)`; ctx.fill();
+    ctx.beginPath(); ctx.arc(eyeX - S * 0.012, eyeY - S * 0.012, S * 0.018, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255,255,255,${{0.80 * lightMod}})`; ctx.fill();
+  }}
+
+  // === Hinterflügel ===
+  function drawHindwing(side, S, fp, lightMod) {{
+    const w = fp.hindwingScale;
+    ctx.beginPath();
+    ctx.moveTo(0, S * 0.02);
+    ctx.bezierCurveTo(S * 0.20, S * 0.05, S * 0.45 * w, S * 0.10, S * 0.65 * w, S * 0.25);
+    ctx.bezierCurveTo(S * 0.75 * w, S * 0.40, S * 0.70 * w, S * 0.55, S * 0.55 * w, S * 0.65);
+    ctx.bezierCurveTo(S * 0.40 * w, S * 0.70, S * 0.25, S * 0.55, S * 0.10, S * 0.30);
+    ctx.bezierCurveTo(S * 0.05, S * 0.15, 0, S * 0.08, 0, S * 0.02);
+    ctx.closePath();
+    const wingHueShift = Math.sin(Date.now() * fp.breathSpeed) * 8;
+    const h0 = (fp.huePicks[1] + wingHueShift + 360) % 360;
+    const h1 = (fp.huePicks[2] + wingHueShift + 360) % 360;
+    const h2 = (fp.huePicks[0] + wingHueShift + 360) % 360;
+    const g = ctx.createLinearGradient(0, 0, S * w, S * 0.65);
+    g.addColorStop(0,   `hsla(${{h0}}, 80%, ${{52 * lightMod}}%, ${{0.88 * lightMod}})`);
+    g.addColorStop(0.5, `hsla(${{h1}}, 82%, ${{56 * lightMod}}%, ${{0.88 * lightMod}})`);
+    g.addColorStop(1,   `hsla(${{h2}}, 85%, ${{60 * lightMod}}%, ${{0.85 * lightMod}})`);
+    ctx.fillStyle = g; ctx.fill();
+    ctx.save(); ctx.clip();
+    ctx.strokeStyle = `hsla(0, 0%, ${{94 * lightMod}}%, ${{0.85 * lightMod}})`;
+    ctx.lineWidth = S * 0.045;
+    ctx.beginPath();
+    ctx.moveTo(S * 0.20, S * 0.05);
+    ctx.bezierCurveTo(S * 0.45 * w, S * 0.10, S * 0.65 * w, S * 0.25, S * 0.65 * w, S * 0.25);
+    ctx.bezierCurveTo(S * 0.75 * w, S * 0.40, S * 0.70 * w, S * 0.55, S * 0.55 * w, S * 0.65);
+    ctx.bezierCurveTo(S * 0.40 * w, S * 0.70, S * 0.25, S * 0.55, S * 0.10, S * 0.30);
+    ctx.stroke(); ctx.restore();
+    ctx.strokeStyle = `hsla(28, 60%, ${{15 * lightMod}}%, ${{0.75 * lightMod}})`;
+    ctx.lineWidth = S * 0.010;
+    for (let v = 0; v < 3; v++) {{
+      const ang = (0.15 + v * 0.20) * Math.PI;
+      const r2 = S * 0.65 * w;
+      ctx.beginPath();
+      ctx.moveTo(0, S * 0.04);
+      ctx.quadraticCurveTo(Math.cos(ang) * r2 * 0.4, Math.sin(ang) * r2 * 0.4, Math.cos(ang) * r2, Math.sin(ang) * r2 + S * 0.05);
+      ctx.stroke();
+    }}
+    ctx.beginPath(); ctx.arc(S * 0.40 * w, S * 0.50, S * 0.05, 0, Math.PI * 2);
+    ctx.fillStyle = `hsla(0, 0%, 8%, ${{0.80 * lightMod}})`; ctx.fill();
+    ctx.beginPath(); ctx.arc(S * 0.40 * w, S * 0.50, S * 0.030, 0, Math.PI * 2);
+    ctx.fillStyle = `hsla(${{fp.spotHue}}, ${{fp.spotSat}}%, ${{fp.spotLit * lightMod}}%, 0.85)`; ctx.fill();
+  }}
+
+  // === Body ===
+  function drawBody(S, fp) {{
+    const bodyLen = S * 0.55 * fp.bodyTone;
+    const bodyW = S * 0.055 * fp.bodyTone;
+    const bodyCenterY = S * 0.18;
+    const bodyGrad = ctx.createLinearGradient(-bodyW, 0, bodyW, 0);
+    bodyGrad.addColorStop(0, '#0a0809');
+    bodyGrad.addColorStop(0.45, '#1a1612');
+    bodyGrad.addColorStop(0.55, '#221c14');
+    bodyGrad.addColorStop(1, '#0a0809');
+    ctx.beginPath();
+    ctx.moveTo(-bodyW, bodyCenterY - bodyLen / 2);
+    ctx.bezierCurveTo(-bodyW * 0.9, bodyCenterY, -bodyW * 0.4, bodyCenterY + bodyLen / 2, 0, bodyCenterY + bodyLen / 2);
+    ctx.bezierCurveTo(bodyW * 0.4, bodyCenterY + bodyLen / 2, bodyW * 0.9, bodyCenterY, bodyW, bodyCenterY - bodyLen / 2);
+    ctx.closePath();
+    ctx.fillStyle = bodyGrad; ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+    ctx.lineWidth = 0.4;
+    for (let i = 1; i < 5; i++) {{
+      const segY = bodyCenterY - bodyLen / 2 + (bodyLen / 5) * i;
+      ctx.beginPath(); ctx.moveTo(-bodyW * 0.85, segY); ctx.lineTo(bodyW * 0.85, segY); ctx.stroke();
+    }}
+    const thoraxY = bodyCenterY - bodyLen / 2 - S * 0.04;
+    ctx.beginPath();
+    ctx.ellipse(0, thoraxY, bodyW * 1.5, S * 0.12, 0, 0, Math.PI * 2);
+    ctx.fillStyle = bodyGrad; ctx.fill();
+    const fluffGrad = ctx.createRadialGradient(0, thoraxY - S * 0.03, 0, 0, thoraxY, S * 0.13);
+    fluffGrad.addColorStop(0, 'rgba(255, 200, 90, 0.22)');
+    fluffGrad.addColorStop(1, 'rgba(255, 200, 90, 0)');
+    ctx.fillStyle = fluffGrad;
+    ctx.beginPath();
+    ctx.ellipse(0, thoraxY, bodyW * 1.5, S * 0.12, 0, 0, Math.PI * 2);
+    ctx.fill();
+    const headY = thoraxY - S * 0.15;
+    ctx.beginPath(); ctx.arc(0, headY, S * 0.075, 0, Math.PI * 2);
+    ctx.fillStyle = '#1a1a22'; ctx.fill();
+    const headHighlight = ctx.createRadialGradient(-S * 0.02, headY - S * 0.02, 0, 0, headY, S * 0.075);
+    headHighlight.addColorStop(0, 'rgba(220, 200, 230, 0.45)');
+    headHighlight.addColorStop(1, 'rgba(220, 200, 230, 0)');
+    ctx.fillStyle = headHighlight;
+    ctx.beginPath(); ctx.arc(0, headY, S * 0.075, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.lineWidth = 1.1;
+    ctx.strokeStyle = 'hsla(40, 70%, 55%, 0.92)';
+    ctx.beginPath();
+    ctx.moveTo(-S * 0.025, headY - S * 0.05);
+    ctx.bezierCurveTo(-S * 0.10, headY - S * 0.22, -S * 0.22, headY - S * 0.36, -S * 0.16, headY - S * 0.42);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.ellipse(-S * 0.16, headY - S * 0.42, S * 0.022, S * 0.016, -0.3, 0, Math.PI * 2);
+    ctx.fillStyle = 'hsla(45, 85%, 60%, 0.95)'; ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(S * 0.025, headY - S * 0.05);
+    ctx.bezierCurveTo(S * 0.10, headY - S * 0.22, S * 0.22, headY - S * 0.36, S * 0.16, headY - S * 0.42);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.ellipse(S * 0.16, headY - S * 0.42, S * 0.022, S * 0.016, 0.3, 0, Math.PI * 2);
+    ctx.fillStyle = 'hsla(45, 85%, 60%, 0.95)'; ctx.fill();
+  }}
+
+  function drawButterfly(x, y, wingPhase, sz, h, heading) {{
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(heading + Math.PI / 2);
+    const fp = getFormParams(h);
+    const S = sz * 1.4 * fp.sizeVar;
+    const perspX = 0.30 + (1 + wingPhase) * 0.35;
+    const wingFold = 0.92 - Math.abs(wingPhase) * 0.10;
+    const lightMod = 0.65 + perspX * 0.40;
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(0, S * 1.2, S * 0.95 * perspX, S * 0.08, 0, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.20)';
+    ctx.filter = 'blur(5px)';
+    ctx.fill();
+    ctx.restore();
+    ctx.save(); ctx.scale(-perspX, wingFold); drawHindwing(-1, S, fp, lightMod); ctx.restore();
+    ctx.save(); ctx.scale(perspX, wingFold);  drawHindwing(1, S, fp, lightMod);  ctx.restore();
+    ctx.save(); ctx.scale(-perspX, wingFold); drawForewing(-1, S, fp, lightMod); ctx.restore();
+    ctx.save(); ctx.scale(perspX, wingFold);  drawForewing(1, S, fp, lightMod);  ctx.restore();
+    drawBody(S, fp);
+    ctx.restore();
+  }}
+
+  // === Sternenstaub-Trail ===
+  const pollen = [];
+  function spawnPollen(x, y, vyOverride, color, form) {{
+    pollen.push({{
+      x: x, y: y,
+      vx: (Math.random() - 0.5) * 0.85,
+      vy: vyOverride !== undefined ? vyOverride : (Math.random() - 0.3) * 0.65,
+      life: 1.0,
+      color: color || `hsla(${{40 + Math.random() * 15}}, 88%, ${{58 + Math.random() * 12}}%, 1)`,
+      size: 1.2 + Math.random() * 1.8,
+      form: form || 'dot',
+      rot: Math.random() * Math.PI * 2,
+    }});
+    if (pollen.length > 450) pollen.shift();
+  }}
+
+  function drawPollen(dt) {{
+    for (let i = pollen.length - 1; i >= 0; i--) {{
+      const p = pollen[i];
+      p.x += p.vx; p.y += p.vy; p.vy += 0.006;
+      p.life -= dt / 3200;
+      if (p.life <= 0) {{ pollen.splice(i, 1); continue; }}
+      ctx.globalAlpha = p.life * 0.7;
+      const tinted = p.color.replace(/,\\s*[\\d.]+\\)\\s*$/, `,${{p.life * 0.7}})`);
+      ctx.fillStyle = tinted; ctx.strokeStyle = tinted;
+      const r = p.size * (0.5 + p.life * 0.5);
+      if (p.form === 'star') {{
+        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+        drawStar(0, 0, r * 1.3, r * 0.55);
+        ctx.fill(); ctx.restore();
+      }} else if (p.form === 'line') {{
+        ctx.lineWidth = Math.max(0.8, r * 0.7);
+        ctx.beginPath();
+        ctx.moveTo(p.x - Math.cos(p.rot) * r * 1.2, p.y - Math.sin(p.rot) * r * 1.2);
+        ctx.lineTo(p.x + Math.cos(p.rot) * r * 1.2, p.y + Math.sin(p.rot) * r * 1.2);
+        ctx.stroke();
+      }} else {{
+        ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+      }}
+    }}
+    ctx.globalAlpha = 1;
+  }}
+
+  // === Animation ===
+  let lastT = 0;
+  function anim(t) {{
+    const dt = t - lastT || 16; lastT = t;
+    // Canvas TRANSPARENT halten — sonst überdeckt das Wasserzeichen die ShinNexus-UI!
+    ctx.clearRect(0, 0, cvs.width, cvs.height);
+    const now = Date.now();
+    const cycle = 23000;  // 18s Flug + 5s Pause
+    const phase = now % cycle;
+    const cycleNum = Math.floor(now / cycle);
+    if (cycleNum !== _lastCycle) {{
+      _lastCycle = cycleNum;
+      _rs = codeSeed;
+      for (let i = 0; i < cycleNum % 50; i++) sR();
+      newFlight();
+    }}
+    drawPollen(dt);
+    if (phase < 18000) {{
+      const t01 = phase / 18000;
+      const pos = getPos(t01);
+      const px = pos.x * cvs.width;
+      const py = pos.y * cvs.height;
+      const wingPhase = Math.sin(now * 0.012);
+      const heading = getHeading(t01);
+      const trailFp = getFormParams(hash);
+      if (trailFp.hasTailPattern && Math.random() < 0.32) {{
+        const pool = trailFp.tailPool;
+        const form = pool[Math.floor(Math.random() * pool.length)];
+        const trailHue = (trailFp.huePicks[Math.floor(Math.random() * 3)] + (Math.random() - 0.5) * 18 + 360) % 360;
+        const trailColor = `hsla(${{trailHue}}, 80%, ${{58 + Math.random() * 12}}%, 1)`;
+        spawnPollen(px + (Math.random() - 0.5) * 10, py + (Math.random() - 0.5) * 10, undefined, trailColor, form);
+      }}
+      drawButterfly(px, py, wingPhase, 16, hash, heading);
+    }}
+    requestAnimationFrame(anim);
+  }}
+  requestAnimationFrame(anim);
 }})();
 </script>
 {_chain_footer}
