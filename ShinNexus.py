@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Shinpai-AI — AGPL-3.0
+# See LICENSE for details. Same Knowledge. Your Ownership.
 # -*- coding: utf-8 -*-
 """
 ShinNexus — Portable Identity Service
@@ -84,7 +86,7 @@ import signal
 #  KONSTANTEN & PFADE
 # ══════════════════════════════════════════════════════════════════════
 
-VERSION = "2.0.0"  # V1.5.5: Owner-Migration, Nexus-Dissolve, UI-Polish, Neon-LED, Bot-Counter, Member-Sort, Veriff-Toggle
+VERSION = "2.0.6"  # 2.0.6: Card-Replace UI-Fix (verified_stripe-Flag bleibt by design, Frontend muss card_pending_replacement mitprüfen)
 APP_NAME = "ShinNexus"
 DEFAULT_PORT = 12345
 
@@ -394,14 +396,53 @@ def save_config(cfg: dict):
 
 
 def _get_smtp_password() -> str:
-    """SMTP-Passwort aus Vault laden."""
+    """SMTP-Passwort aus Vault laden. Migriert Plain-Text-Reste aus cfg["smtp"]["password"] transparent.
+
+    Lehre 2026-05-03: SMTP-PW wurde früher direkt im Plain-JSON-Config persistiert.
+    Beim ersten Lesezugriff nach dem Fix wird ein noch vorhandener Plain-PW automatisch
+    ins Vault verschoben und aus dem JSON entfernt. Vault zu? Plain-PW bleibt liegen
+    bis Vault aufgemacht ist — nichts zerstören, nur sichern wenn möglich."""
     smtp_vault = VAULT_DIR / "smtp.vault"
+    # Auto-Migration: Plain-PW aus cfg in Vault verschieben (einmalig)
+    try:
+        cfg = load_config()
+        plain = (cfg.get("smtp") or {}).get("password", "")
+        if plain and vault_is_unlocked():
+            if _save_smtp_password(plain):
+                cfg["smtp"].pop("password", None)
+                save_config(cfg)
+                nexus_log("🔐 SMTP-PW aus Plain-Config in Vault migriert", "cyan")
+    except Exception as e:
+        nexus_log(f"⚠️ SMTP-PW Migration-Check fehlgeschlagen: {e}", "yellow")
     if smtp_vault.exists() and vault_is_unlocked():
         try:
             return vault_decrypt(smtp_vault.read_bytes()).decode("utf-8")
         except Exception:
             return ""
     return ""
+
+
+def _save_smtp_password(password: str) -> bool:
+    """SMTP-Passwort verschlüsselt in smtp.vault schreiben. Vault muss offen sein.
+    Leerer String → Vault-Datei löschen (PW entfernt)."""
+    smtp_vault = VAULT_DIR / "smtp.vault"
+    if not vault_is_unlocked():
+        return False
+    try:
+        VAULT_DIR.mkdir(parents=True, exist_ok=True)
+        if not password:
+            if smtp_vault.exists():
+                smtp_vault.unlink()
+            return True
+        smtp_vault.write_bytes(vault_encrypt(password.encode("utf-8")))
+        try:
+            os.chmod(smtp_vault, 0o600)
+        except OSError:
+            pass
+        return True
+    except Exception as e:
+        nexus_log(f"❌ SMTP-PW Vault-Save fehlgeschlagen: {e}", "red")
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1220,10 +1261,29 @@ def _b62_hash(seed: str, length: int = 6) -> str:
 
 
 def _generate_shinpai_id(name: str, email: str) -> str:
-    """Nexus Shinpai-ID: [NameHash6]-[EmailHash6]. Permanent."""
+    """Nexus Shinpai-ID (User): [NameHash6]-[EmailHash6]. Permanent."""
     name_hash = _b62_hash(f"shinpai-name-{name}")
     email_hash = _b62_hash(f"shinpai-email-{email}")
     return f"{name_hash}-{email_hash}"
+
+
+def _generate_program_shinpai_id(source_app: str, owner_shinpai_id: str) -> str:
+    """Programm-Shinpai-ID: [AppHash6]-[OwnerHash6]. Permanent + deterministisch.
+
+    Hasi-Diktat 2026-05-05 (Universal-Schema [ContextHash6]-[KeyHash6]):
+    Jede Entität im Shinpai-Universum bekommt eine ID nach diesem Pattern.
+    Für Owner-Programme: linke Hälfte = Programm-Klasse, rechte Hälfte = Owner.
+    Liest sich als "App pQrSt7 von Owner aB3cDe".
+
+    Eigenschaften:
+    - Deterministisch: gleiche Eingaben → gleiche ID, immer
+    - Eindeutig pro (source_app, owner_shinpai_id)-Paar (~3.2 Trillionen Kombos)
+    - Self-healing: Programm kann ID nach Igni-Verlust neu berechnen
+    - Identifier, NICHT Auth — Auth läuft weiter über connection_token
+    """
+    app_hash = _b62_hash(f"shinpai-app-{(source_app or '').strip()}")
+    owner_hash = _b62_hash(f"shinpai-owner-{(owner_shinpai_id or '').strip()}")
+    return f"{app_hash}-{owner_hash}"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1588,6 +1648,57 @@ def _license_verify(license_dict: dict) -> tuple[bool, list[str]]:
         reasons.append(f"verify_exception:{e}")
 
     return (len(reasons) == 0), reasons
+
+
+def _resign_owner_issued_licenses() -> dict:
+    """Re-Signiert alle Lizenzen in LICENSES_ISSUED_VAULT mit dem aktuellen _pq_keys.
+
+    Wird gebraucht wenn Owner-PQ-Keys rotiert haben (z.B. nach Owner-Migrate):
+    alte Signaturen sind dann gegen den neuen Public-Key nicht mehr verifizierbar.
+    Diese Funktion läuft durch, ersetzt issuer.public_key + signature in jedem
+    Eintrag, schreibt zurück.
+
+    Lizenzen mit Issuer != aktueller Owner-shinpai_id werden NICHT angefasst
+    (z.B. von anderen Nexussen empfangene Lizenzen — die kann Owner nicht
+    neu signieren weil er die fremden Private-Keys nicht hat).
+
+    Returns: {resigned: int, skipped: int, errors: int}
+    """
+    if not _pq_keys or not _identity:
+        return {"resigned": 0, "skipped": 0, "errors": 0, "error": "no_keys_or_identity"}
+    issued = _license_load_vault(LICENSES_ISSUED_VAULT)
+    if not issued:
+        return {"resigned": 0, "skipped": 0, "errors": 0}
+    new_issuer_pk = _pq_keys.get("sig_pk", "")
+    owner_sid = _identity.get("shinpai_id", "")
+    resigned = 0
+    skipped = 0
+    errors = 0
+    out = []
+    for lic in issued:
+        try:
+            iss = lic.get("issuer", {}) or {}
+            if iss.get("shinpai_id") != owner_sid:
+                # fremde Lizenz, nicht anfassen
+                out.append(lic)
+                skipped += 1
+                continue
+            # Issuer-Public-Key updaten + neu signieren
+            lic["issuer"]["public_key"] = new_issuer_pk
+            # signature + signed_payload_hash entfernen, _license_sign baut beide neu
+            lic.pop("signature", None)
+            lic.pop("signed_payload_hash", None)
+            signed = _license_sign(lic)
+            out.append(signed)
+            resigned += 1
+        except Exception as e:
+            nexus_log(f"⚠️ Re-Sign-Fehler für Lizenz {lic.get('license_id','?')}: {e}", "yellow")
+            out.append(lic)
+            errors += 1
+    if resigned > 0:
+        _license_save_vault(LICENSES_ISSUED_VAULT, out)
+        nexus_log(f"🔁 Re-Sign abgeschlossen: {resigned} resigned, {skipped} skipped, {errors} errors", "green")
+    return {"resigned": resigned, "skipped": skipped, "errors": errors}
 
 
 def _license_load_vault(vault_path: Path) -> list:
@@ -2235,6 +2346,688 @@ def _load_users() -> bool:
         nexus_log(f"Users laden fehlgeschlagen: {e}", "red")
         _users = {}
         return False
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  PAIR-API — Verbundene Programme (ShinShare/Shidow/...) anbinden
+#  Hasi-Diktat 2026-05-03: Heimwerker-tauglich, Phishing-resistent,
+#  zentral revoke-bar, OAuth-Redirect-Killer für localhost-Setups.
+# ══════════════════════════════════════════════════════════════════════
+
+_pending_pairings: dict = {}   # {code: {"user_shinpai_id", "username", "label_hint", "expires_at", "created_at"}}
+_connections: dict = {}        # {connection_id: {user_shinpai_id, source_app, source_url, source_version, token_hash, pending_token_hash, vorschuss_at, scopes, created_at, last_used_at, revoked_at}}
+_pending_plain_tokens: dict = {}  # {connection_id: plain_new_token}  — NUR RAM, niemals persistent (sonst Token leakt aus Vault-File)
+
+# Pair-Flow (1-Klick via Polling, Hasi-Diktat 2026-05-03)
+# {request_id: {created_at, expires_at, source_app, source_url, status, plain_token?, error?}}
+# status ∈ {"pending", "approved", "denied", "expired"}
+# plain_token nur in RAM, einmalig vom Polling-Endpoint zurückgegeben
+_pair_requests: dict = {}
+PAIR_REQUEST_TTL = 600        # 10 min für User um zu bestätigen
+PAIR_REQUEST_PICKUP_TTL = 60  # 60 sec nach Approve in dem App den Token abholen muss
+
+CONNECTIONS_VAULT = VAULT_DIR / "connections.vault"
+
+PAIR_CODE_TTL = 300            # 5 Minuten
+PAIR_MAX_PENDING_PER_USER = 3  # max parallele Codes pro User
+# Crockford-Base32 ohne 0/O/I/1 — Lesbarkeit
+_PAIR_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+
+
+def _save_connections():
+    """Connection-Records in Vault speichern."""
+    if not vault_is_unlocked():
+        return
+    data = json.dumps(_connections, ensure_ascii=False).encode("utf-8")
+    CONNECTIONS_VAULT.write_bytes(vault_encrypt(data))
+    try:
+        os.chmod(CONNECTIONS_VAULT, 0o600)
+    except OSError:
+        pass
+
+
+def _load_connections() -> bool:
+    """Connections aus Vault laden."""
+    global _connections
+    if not CONNECTIONS_VAULT.exists():
+        _connections = {}
+        return True
+    try:
+        raw = vault_decrypt(CONNECTIONS_VAULT.read_bytes())
+        _connections = json.loads(raw.decode())
+        nexus_log(f"{len(_connections)} Connections geladen", "green")
+        return True
+    except Exception as e:
+        nexus_log(f"Connections laden fehlgeschlagen: {e}", "red")
+        _connections = {}
+        return False
+
+
+def _generate_pair_code() -> str:
+    """8 Zeichen Crockford-Base32, formatiert 'ABC-DEF-GH'."""
+    raw = "".join(secrets.choice(_PAIR_ALPHABET) for _ in range(8))
+    return f"{raw[:3]}-{raw[3:6]}-{raw[6:]}"
+
+
+def _normalize_pair_code(code: str) -> str:
+    """User-Eingabe normalisieren: alles UPPER, Bindestriche raus, Whitespace raus."""
+    if not code:
+        return ""
+    return "".join(c for c in code.upper() if c in _PAIR_ALPHABET)
+
+
+def _gc_pending_pairings():
+    """Abgelaufene Pending-Codes wegräumen (in-memory, kein Vault)."""
+    now = time.time()
+    for code in list(_pending_pairings.keys()):
+        if _pending_pairings[code]["expires_at"] < now:
+            del _pending_pairings[code]
+
+
+def _user_pending_count(shinpai_id: str) -> int:
+    _gc_pending_pairings()
+    return sum(1 for p in _pending_pairings.values() if p["user_shinpai_id"] == shinpai_id)
+
+
+def pair_start_for_user(shinpai_id: str, username: str, label_hint: str = "") -> dict:
+    """
+    Generiert einen 8-Zeichen Pair-Code für den User.
+    Wirft ValueError wenn Quota überschritten (3 parallel).
+
+    Liefert {"code": "ABC-DEF-GH", "expires_at": <unix-ts>, "ttl_seconds": 300}.
+    """
+    _gc_pending_pairings()
+    if _user_pending_count(shinpai_id) >= PAIR_MAX_PENDING_PER_USER:
+        raise ValueError(
+            f"Max {PAIR_MAX_PENDING_PER_USER} Pairing-Codes parallel — alte ablaufen lassen oder einlösen."
+        )
+
+    code = _generate_pair_code()
+    raw_code = _normalize_pair_code(code)
+    now = time.time()
+    _pending_pairings[raw_code] = {
+        "user_shinpai_id": shinpai_id,
+        "username": username,
+        "label_hint": (label_hint or "").strip()[:80],
+        "expires_at": now + PAIR_CODE_TTL,
+        "created_at": now,
+    }
+    nexus_log(f"🔗 PAIR-CODE generiert für {username} ({code}, TTL {PAIR_CODE_TTL}s)", "cyan")
+    return {
+        "code": code,
+        "expires_at": int(now + PAIR_CODE_TTL),
+        "ttl_seconds": PAIR_CODE_TTL,
+    }
+
+
+def pair_exchange(code_input: str, source_app: str, source_url: str = "",
+                   source_version: str = "", machine_id: str = "") -> dict:
+    """
+    Single-use Code-Einlösung. Liefert User-Profil + Connection-Token.
+    machine_id wird gespeichert für spätere Refresh-Härtung (Phase 6 Hasi-Diktat
+    2026-05-04): Refresh-Calls müssen mit derselben machine_id kommen wie die
+    Pair-Exchange-Zeit-machine_id.
+
+    Wirft ValueError bei ungültigem/verfallenem/eingelöstem Code.
+    """
+    raw_code = _normalize_pair_code(code_input)
+    if not raw_code or len(raw_code) != 8:
+        raise ValueError("Code-Format ungültig")
+    _gc_pending_pairings()
+    pending = _pending_pairings.get(raw_code)
+    if not pending:
+        raise ValueError("Code ungültig, verfallen oder bereits eingelöst")
+    if pending["expires_at"] < time.time():
+        del _pending_pairings[raw_code]
+        raise ValueError("Code verfallen")
+
+    # Single-use: Code verbrauchen
+    del _pending_pairings[raw_code]
+
+    shinpai_id = pending["user_shinpai_id"]
+    username = pending["username"]
+
+    # User-Daten zusammensuchen (Owner oder normaler User)
+    is_owner = bool(_identity and _identity.get("shinpai_id") == shinpai_id)
+    if is_owner:
+        user_record = _identity
+        display_name = _identity.get("name", username)
+        email = _identity.get("email", "")
+        verification_level = "owner"
+    else:
+        user_record = _users.get(username, {})
+        display_name = user_record.get("name", username)
+        email = user_record.get("email", "")
+        verification_level = user_record.get("verification_level", "standard")
+
+    # Token + Hash IMMER frisch — auch beim Re-Pair-Exchange rotiert der Token.
+    connection_token = "ct-" + secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(connection_token.encode()).hexdigest()
+    now = int(time.time())
+
+    src_app_norm = (source_app or "unknown").strip()
+
+    # Hasi-Diktat 2026-05-05 (Trick 17 / saubere Pflege + Universal-Schema):
+    # Eine Owner-Connection pro (shinpai_id, source_app) — Lookup über die
+    # deterministische Programm-Shinpai-ID (O(1) dict-Access, keine Loop-Suche).
+    # Bei Re-Pair-Exchange wird die bestehende wiederverwendet (selbe ID, neuer Token).
+    existing_owner_conn = None
+    if is_owner:
+        expected_program_id = _generate_program_shinpai_id(src_app_norm, shinpai_id)
+        candidate = _connections.get(expected_program_id)
+        if (candidate is not None
+                and not candidate.get("revoked_at")
+                and candidate.get("verification_level") == "owner"
+                and candidate.get("user_shinpai_id") == shinpai_id):
+            existing_owner_conn = candidate
+
+    # Hasi-Diktat 2026-05-04: alte aktive Connections der gleichen
+    # (user_shinpai_id, source_app)-Kombo automatisch revoken — verhindert
+    # Sammelei alter Pair-Einträge bei jedem neuen Setup.
+    # Owner-Connections werden NICHT auto-revoked (Trick 17 Owner-Schutz).
+    cleaned = 0
+    for cid, c in list(_connections.items()):
+        if (c.get("user_shinpai_id") == shinpai_id
+                and c.get("source_app") == src_app_norm
+                and not c.get("revoked_at")
+                and c.get("verification_level") != "owner"):
+            c["revoked_at"] = now
+            c["revoked_reason"] = "auto-revoke: replaced by new pair-exchange"
+            cleaned += 1
+    if cleaned:
+        nexus_log(f"🧹 Auto-Revoke: {cleaned} alte Connection(s) für {username}/{src_app_norm} aufgeräumt", "cyan")
+
+    if existing_owner_conn is not None:
+        # Owner-Re-Pair: bestehende Connection updaten (Token rotiert, ID bleibt)
+        connection_id = existing_owner_conn["connection_id"]
+        existing_owner_conn["token_hash"] = token_hash
+        existing_owner_conn["secret_token"] = connection_token
+        existing_owner_conn["machine_id"] = (machine_id or existing_owner_conn.get("machine_id", "")).strip()[:128]
+        existing_owner_conn["source_url"] = source_url or existing_owner_conn.get("source_url", "")
+        existing_owner_conn["source_version"] = source_version or existing_owner_conn.get("source_version", "")
+        existing_owner_conn["last_used_at"] = now
+        existing_owner_conn["last_refreshed_at"] = now
+        existing_owner_conn["pending_token_hash"] = None
+        existing_owner_conn["vorschuss_at"] = None
+        nexus_log(f"🔁 OWNER-RE-PAIR — {src_app_norm} an {username} ({connection_id}, Token rotiert)", "cyan")
+    else:
+        # Frische Connection.
+        # Hasi-Diktat 2026-05-05 (Universal-Schema): Owner-Programme bekommen
+        # die deterministische Programm-Shinpai-ID — Re-Pair findet automatisch
+        # denselben Schlüssel ohne Loop. Non-Owner bleiben random.
+        if is_owner:
+            connection_id = _generate_program_shinpai_id(src_app_norm, shinpai_id)
+        else:
+            connection_id = "conn-" + secrets.token_hex(12)
+        _connections[connection_id] = {
+            "connection_id": connection_id,
+            "user_shinpai_id": shinpai_id,
+            "username": username,
+            "source_app": source_app or "unknown",
+            "source_url": source_url or "",
+            "source_version": source_version or "",
+            "machine_id": (machine_id or "").strip()[:128],
+            "label_hint": pending.get("label_hint", ""),
+            "token_hash": token_hash,
+            # Hasi-Diktat 2026-05-05 (Trick 17): Owner-Connections speichern den
+            # Klartext-Token zusätzlich verschlüsselt im connections.vault, damit
+            # /api/account/connections/owner-resume ihn nach erfolgreichem
+            # Voll-Login zurückgeben kann (Vault-Reentry ohne Igni).
+            "secret_token": connection_token if is_owner else None,
+            "verification_level": verification_level,
+            "pending_token_hash": None,
+            "vorschuss_at": None,
+            "scopes": ["profile:read", "email:read"],
+            "created_at": now,
+            "last_used_at": now,
+            "last_refreshed_at": now,
+            "revoked_at": None,
+        }
+    _save_connections()
+
+    nexus_log(f"🔗 PAIR-EXCHANGE — {source_app} an {username} ({connection_id})", "green")
+
+    return {
+        "shinpai_id": shinpai_id,
+        "nexus_id": shinpai_id,        # Alias für Apps die "nexus_id" erwarten
+        "sub": shinpai_id,             # Alias für OAuth-kompatible Apps
+        "display_name": display_name,
+        "email": email,
+        "verification_level": verification_level,
+        "moonpie_id": user_record.get("moonpie_id"),
+        "connection_token": connection_token,  # nur jetzt zurückgegeben — später nur Hash in DB
+        "connection_id": connection_id,
+        "expires_at": None,
+        "scopes": ["profile:read", "email:read"],
+    }
+
+
+def list_user_connections(shinpai_id: str) -> list:
+    """Liefert alle nicht-revokten Connections eines Users.
+
+    Hasi-Diktat 2026-05-05 (Trick 17): secret_token ist Klartext im
+    Owner-Vault — niemals via API-List leaken.
+    """
+    return sorted(
+        [
+            {k: v for k, v in c.items() if k not in ("token_hash", "secret_token")}
+            for c in _connections.values()
+            if c.get("user_shinpai_id") == shinpai_id and not c.get("revoked_at")
+        ],
+        key=lambda c: c["created_at"],
+        reverse=True,
+    )
+
+
+def owner_resume_for_app(source_app: str, password: str, totp_code: str = "") -> dict:
+    """Trick 17 — Owner-Programm-Reentry ohne neuen Pair-Exchange.
+
+    Liefert den gespeicherten Klartext-Token einer Owner-Connection zurück,
+    nachdem der Owner sich mit Passwort + 2FA authentifiziert hat. Damit
+    kann das Programm seinen mit dem alten Token verschlüsselten Vault
+    wieder aufschließen, auch wenn der Igni weg ist.
+
+    Voraussetzung: Vault offen (sonst kein Zugriff auf _connections),
+    Owner-PW + TOTP korrekt, aktive Owner-Connection für source_app vorhanden.
+
+    Returns:
+      {ok: True, connection_id, connection_token, ...}  bei Erfolg
+    Wirft:
+      RuntimeError("vault_locked") | ValueError("auth_failed") |
+      ValueError("no_owner_connection")
+    """
+    if not vault_is_unlocked():
+        raise RuntimeError("vault_locked")
+    if not _identity:
+        raise ValueError("no_identity")
+    if not _verify_owner_password(password):
+        raise ValueError("auth_failed")
+    if _identity.get("totp_confirmed"):
+        if not totp_code or not totp_verify(_identity.get("totp_secret", ""), totp_code):
+            raise ValueError("totp_failed")
+
+    shinpai_id = _identity.get("shinpai_id", "")
+    src_app_norm = (source_app or "unknown").strip()
+    now = int(time.time())
+
+    # Hasi-Diktat 2026-05-05 (Universal-Schema): Programm-Shinpai-ID ist
+    # deterministisch aus (source_app, owner_shinpai_id) ableitbar →
+    # direkter dict-Lookup, kein Loop. Self-healing falls Programm seine
+    # ID verloren hat: einfach neu rechnen.
+    expected_program_id = _generate_program_shinpai_id(src_app_norm, shinpai_id)
+    candidate = _connections.get(expected_program_id)
+
+    # Härtungs-Check: ID zwar gefunden, aber Connection muss
+    # Owner-validiert + nicht revoked + secret_token vorhanden sein
+    if (candidate is None
+            or candidate.get("revoked_at")
+            or candidate.get("verification_level") != "owner"
+            or not candidate.get("secret_token")
+            or candidate.get("user_shinpai_id") != shinpai_id):
+        raise ValueError("no_owner_connection")
+
+    candidate["last_used_at"] = now
+    _save_connections()
+
+    nexus_log(f"🔑 OWNER-RESUME — {src_app_norm} ({candidate['connection_id']})", "green")
+    return {
+        "ok": True,
+        "shinpai_id": shinpai_id,
+        "nexus_id": shinpai_id,
+        "sub": shinpai_id,
+        "display_name": _identity.get("name", ""),
+        "email": _identity.get("email", ""),
+        "verification_level": "owner",
+        "connection_id": candidate["connection_id"],
+        "connection_token": candidate["secret_token"],
+        "scopes": candidate.get("scopes", []),
+    }
+
+
+def revoke_connection(connection_id: str, by_shinpai_id: str = "",
+                       by_token: str = "", reason: str = "",
+                       force_owner_destructive: bool = False) -> bool:
+    """
+    Revoke einer Connection. Auth über Owner-shinpai_id ODER über connection_token.
+    Liefert True bei Erfolg, False wenn nicht gefunden / nicht autorisiert.
+
+    Hasi-Diktat 2026-05-05 (Trick 17 Owner-Lösch-Schutz):
+    Owner-Connections können nur mit force_owner_destructive=True revoked werden,
+    damit der Vault auf Programm-Seite nicht still stirbt. Aufrufer (HTTP-Handler)
+    muss vorher PW+2FA verifizieren UND eine ausdrückliche Bestätigung einholen.
+    Ohne den Flag: Funktion gibt False zurück und ändert nichts.
+    """
+    conn = _connections.get(connection_id)
+    if not conn or conn.get("revoked_at"):
+        return False
+
+    if conn.get("verification_level") == "owner" and not force_owner_destructive:
+        nexus_log(f"🛡️ Owner-Lösch-Schutz: revoke abgelehnt für {connection_id}", "yellow")
+        return False
+
+    authorized = False
+    if by_shinpai_id and conn.get("user_shinpai_id") == by_shinpai_id:
+        authorized = True
+    if not authorized and by_token:
+        token_hash = hashlib.sha256(by_token.encode()).hexdigest()
+        if secrets.compare_digest(token_hash, conn.get("token_hash", "")):
+            authorized = True
+    if not authorized:
+        return False
+
+    conn["revoked_at"] = int(time.time())
+    conn["revoke_reason"] = reason or "owner_initiated"
+    _save_connections()
+    nexus_log(f"🔗 CONNECTION revoked — {connection_id} ({reason})", "yellow")
+    return True
+
+
+def find_connection_by_token(token: str):
+    """Liefert Connection-Dict wenn Token matcht (auch pending) und nicht revoked, sonst None."""
+    if not token:
+        return None
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    for conn in _connections.values():
+        if conn.get("revoked_at"):
+            continue
+        if secrets.compare_digest(token_hash, conn.get("token_hash", "")):
+            return conn
+        # Auch pending_token akzeptieren — falls App vor dem Refresh-Call mit altem
+        # Token kommt aber Refresh schon stattgefunden hat (Race-Condition-safe)
+        pending = conn.get("pending_token_hash") or ""
+        if pending and secrets.compare_digest(token_hash, pending):
+            return conn
+    return None
+
+
+# ── Pair-Flow (1-Klick via Polling) ─────────────────────────────────────────
+
+
+def _gc_pair_requests():
+    now = int(time.time())
+    for rid in list(_pair_requests):
+        if _pair_requests[rid]["expires_at"] < now:
+            _pair_requests[rid]["status"] = "expired"
+            # Komplett wegräumen nach extra-puffer
+            if (now - _pair_requests[rid]["expires_at"]) > 60:
+                del _pair_requests[rid]
+
+
+def pair_request_create(request_id: str, source_app: str, source_url: str) -> dict:
+    """
+    Wird vom Nexus-Frontend aufgerufen wenn der User auf das Approve-Modal landet.
+    Erzeugt eine neue Pending-Request (oder lädt eine bestehende mit gleicher ID).
+    """
+    if not request_id:
+        raise ValueError("request_id Pflicht")
+    _gc_pair_requests()
+    now = int(time.time())
+    if request_id in _pair_requests:
+        return _pair_requests[request_id]
+    _pair_requests[request_id] = {
+        "request_id": request_id,
+        "source_app": (source_app or "unknown")[:40],
+        "source_url": (source_url or "")[:200],
+        "created_at": now,
+        "expires_at": now + PAIR_REQUEST_TTL,
+        "status": "pending",
+    }
+    nexus_log(f"🔗 PAIR-REQUEST gestartet: {request_id} ({source_app})", "cyan")
+    return _pair_requests[request_id]
+
+
+def pair_request_approve(request_id: str, user_shinpai_id: str, username: str,
+                          label_hint: str = "") -> dict:
+    """
+    User klickt im Nexus-Modal „Ja". Wir erzeugen den Token + Connection
+    und legen den Plain-Token in RAM ab damit die App ihn beim nächsten Poll
+    abholen kann.
+    """
+    _gc_pair_requests()
+    pr = _pair_requests.get(request_id)
+    if not pr:
+        raise ValueError("request_id ungültig oder verfallen")
+    if pr["status"] != "pending":
+        raise ValueError(f"Request bereits {pr['status']}")
+
+    # Connection-Row + Token analog pair_exchange
+    if _identity and _identity.get("shinpai_id") == user_shinpai_id:
+        user_record = _identity
+        display_name = _identity.get("name", username)
+        email = _identity.get("email", "")
+        verification_level = "owner"
+    else:
+        user_record = _users.get(username, {})
+        display_name = user_record.get("name", username)
+        email = user_record.get("email", "")
+        verification_level = user_record.get("verification_level", "standard")
+
+    connection_id = "conn-" + secrets.token_hex(12)
+    connection_token = "ct-" + secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(connection_token.encode()).hexdigest()
+    now = int(time.time())
+
+    _connections[connection_id] = {
+        "connection_id": connection_id,
+        "user_shinpai_id": user_shinpai_id,
+        "username": username,
+        "source_app": pr["source_app"],
+        "source_url": pr["source_url"],
+        "source_version": "",
+        "label_hint": (label_hint or "")[:80],
+        "token_hash": token_hash,
+        "pending_token_hash": None,
+        "vorschuss_at": None,
+        "scopes": ["profile:read", "email:read"],
+        "created_at": now,
+        "last_used_at": now,
+        "last_refreshed_at": now,
+        "revoked_at": None,
+    }
+    _save_connections()
+
+    # Status auf approved + Plain-Token zur Pickup
+    pr["status"] = "approved"
+    pr["pickup_until"] = now + PAIR_REQUEST_PICKUP_TTL
+    pr["_user_payload"] = {
+        "shinpai_id": user_shinpai_id,
+        "nexus_id": user_shinpai_id,
+        "sub": user_shinpai_id,
+        "display_name": display_name,
+        "email": email,
+        "verification_level": verification_level,
+        "moonpie_id": user_record.get("moonpie_id"),
+        "connection_token": connection_token,
+        "connection_id": connection_id,
+        "expires_at": None,
+        "scopes": ["profile:read", "email:read"],
+    }
+
+    nexus_log(f"🔗 PAIR-APPROVE — {pr['source_app']} an {username} ({connection_id})", "green")
+    return {"ok": True, "connection_id": connection_id, "pickup_within_seconds": PAIR_REQUEST_PICKUP_TTL}
+
+
+def pair_request_deny(request_id: str) -> dict:
+    """User klickt „Nein" im Modal."""
+    pr = _pair_requests.get(request_id)
+    if not pr:
+        raise ValueError("request_id ungültig")
+    if pr["status"] != "pending":
+        raise ValueError(f"Request bereits {pr['status']}")
+    pr["status"] = "denied"
+    pr["expires_at"] = int(time.time()) + 30  # kurz nach denial wegräumen
+    nexus_log(f"🔗 PAIR-DENY: {request_id}", "yellow")
+    return {"ok": True}
+
+
+def pair_request_poll(request_id: str) -> dict:
+    """App pollt mit request_id. Bei status=approved bekommt sie das User-Payload
+    (incl. plain Token) genau EINMAL — danach wird die Request wegrasiert."""
+    _gc_pair_requests()
+    pr = _pair_requests.get(request_id)
+    if not pr:
+        return {"status": "expired"}
+    status = pr["status"]
+    now = int(time.time())
+
+    if status == "pending":
+        return {"status": "pending"}
+    if status == "denied":
+        return {"status": "denied"}
+    if status == "expired":
+        return {"status": "expired"}
+
+    # status == "approved" — Plain-Token einmal liefern + wegrasieren
+    if status == "approved":
+        if now > pr.get("pickup_until", 0):
+            del _pair_requests[request_id]
+            return {"status": "expired"}
+        payload = pr.get("_user_payload", {})
+        del _pair_requests[request_id]
+        return {"status": "approved", **payload}
+
+    return {"status": "error", "error": f"Unbekannter Status: {status}"}
+
+
+def pair_request_get(request_id: str) -> dict | None:
+    """Liefert öffentlich-sichere Infos zur Request (für das User-Modal)."""
+    _gc_pair_requests()
+    pr = _pair_requests.get(request_id)
+    if not pr:
+        return None
+    return {
+        "request_id": pr["request_id"],
+        "source_app": pr["source_app"],
+        "source_url": pr["source_url"],
+        "created_at": pr["created_at"],
+        "expires_at": pr["expires_at"],
+        "status": pr["status"],
+    }
+
+
+# ── Vertrauensvorschuss: Token-Rotation für alle eigenen Connections ─────────
+
+VORSCHUSS_COOLDOWN = 24 * 3600   # 1x / 24h pro User
+
+
+def vorschuss_roll_for_user(user_shinpai_id: str) -> dict:
+    """
+    Würfelt für ALLE aktiven Connections des Users einen pending_token.
+    Alter token_hash bleibt vorerst aktiv. Erst beim Refresh-Call der App
+    wird getauscht.
+
+    Liefert {"rolled": [conn_ids], "skipped": [conn_ids], "next_allowed_at": ts}.
+    Wirft ValueError wenn Cooldown nicht abgelaufen.
+    """
+    now = int(time.time())
+
+    # Cooldown-Check: letzter Vorschuss aller User-Connections
+    user_conns = [c for c in _connections.values()
+                  if c.get("user_shinpai_id") == user_shinpai_id and not c.get("revoked_at")]
+    last_vorschuss = max((c.get("vorschuss_at") or 0) for c in user_conns) if user_conns else 0
+    if last_vorschuss and (now - last_vorschuss) < VORSCHUSS_COOLDOWN:
+        retry_at = last_vorschuss + VORSCHUSS_COOLDOWN
+        raise ValueError(
+            f"Vorschuss erst wieder ab {time.strftime('%H:%M %d.%m.%Y', time.localtime(retry_at))}"
+        )
+
+    rolled = []
+    skipped = []
+    for conn in user_conns:
+        # Wenn schon pending da (App hat alten Vorschuss noch nicht abgeholt) → überspringen
+        if conn.get("pending_token_hash"):
+            skipped.append(conn["connection_id"])
+            continue
+        new_token = "ct-" + secrets.token_urlsafe(32)
+        conn["pending_token_hash"] = hashlib.sha256(new_token.encode()).hexdigest()
+        conn["vorschuss_at"] = now
+        _pending_plain_tokens[conn["connection_id"]] = new_token  # RAM-only
+        rolled.append(conn["connection_id"])
+
+    if rolled:
+        _save_connections()
+        nexus_log(f"🎲 VORSCHUSS gewürfelt für {user_shinpai_id}: "
+                  f"{len(rolled)} neue Tokens, {len(skipped)} übersprungen", "cyan")
+
+    return {
+        "rolled": rolled,
+        "skipped": skipped,
+        "next_allowed_at": now + VORSCHUSS_COOLDOWN,
+    }
+
+
+CONNECTION_REFRESH_COOLDOWN_SECONDS = 6 * 3600  # Phase 6 Hasi-Diktat: 6h zwischen zwei erfolgreichen Refreshes
+
+
+def refresh_token_for_app(old_token: str, machine_id: str = "") -> dict:
+    """
+    Wird von Apps periodisch aufgerufen mit altem Token im Bearer.
+    Wenn pending_token wartet: tausch + return new_token. Sonst: refreshed=False.
+
+    Phase 6 Härtung (Hasi-Diktat 2026-05-04):
+      - machine_id muss übergeben werden, MUSS gegen die Pair-Exchange-Zeit-
+        machine_id matchen (sonst ValueError)
+      - Zwischen zwei erfolgreichen Token-Tauschen min 6h Cooldown
+      - GUARD: Wenn pair_exchange ohne machine_id passiert ist (Legacy-Connections),
+        wird der erste Refresh-Aufruf mit machine_id den Wert nachtragen statt
+        sofort zu blockieren — sanfte Migration.
+
+    Liefert {"refreshed": bool, "new_token"?: "ct-...", "rotated_at"?: ts}.
+    Wirft ValueError wenn Token / machine_id komplett ungültig.
+    """
+    if not old_token:
+        raise ValueError("Token Pflicht")
+
+    conn = find_connection_by_token(old_token)
+    if not conn:
+        raise ValueError("Token ungültig oder revoked")
+
+    # machine_id-Match
+    stored_mid = (conn.get("machine_id") or "").strip()
+    provided_mid = (machine_id or "").strip()
+    if stored_mid:
+        if not provided_mid or provided_mid != stored_mid:
+            raise ValueError("machine_id-Mismatch — Connection nicht von der ursprünglichen Maschine")
+    else:
+        # Legacy-Connection ohne machine_id → sanft nachtragen wenn vorhanden
+        if provided_mid:
+            conn["machine_id"] = provided_mid[:128]
+
+    now = int(time.time())
+    conn["last_used_at"] = now
+
+    pending_hash = conn.get("pending_token_hash")
+    pending_plain = _pending_plain_tokens.get(conn["connection_id"])
+
+    if not pending_hash or not pending_plain:
+        # Kein pending — alter Token bleibt aktiv, nichts zu tun
+        _save_connections()
+        return {"refreshed": False, "current_valid": True}
+
+    # 6h-Cooldown gegen letzten Token-Tausch
+    last_refreshed = int(conn.get("last_refreshed_at") or 0)
+    if last_refreshed and (now - last_refreshed) < CONNECTION_REFRESH_COOLDOWN_SECONDS:
+        wait_sec = CONNECTION_REFRESH_COOLDOWN_SECONDS - (now - last_refreshed)
+        return {
+            "refreshed": False,
+            "cooldown": True,
+            "wait_seconds": wait_sec,
+        }
+
+    # Pending-Tausch — alter Token wird HIERMIT invalidiert
+    conn["token_hash"] = pending_hash
+    conn["pending_token_hash"] = None
+    conn["last_refreshed_at"] = now
+    conn["vorschuss_at"] = None  # Vorschuss konsumiert
+    _pending_plain_tokens.pop(conn["connection_id"], None)
+    _save_connections()
+
+    nexus_log(f"🔄 TOKEN-REFRESH — {conn['source_app']} ({conn['connection_id']})", "green")
+    return {
+        "refreshed": True,
+        "new_token": pending_plain,
+        "rotated_at": now,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -3280,13 +4073,13 @@ class VerificationProvider:
 
 
 class StripeSetupIntentProvider(VerificationProvider):
-    """Stufe 1: Kreditkartencheck via Stripe SetupIntent.
-    Verifiziert echte Kreditkarte OHNE Abbuchung = 18+ Nachweis.
+    """Stufe 2 (5-Stufen-Schema, Hasi-Diktat 2026-05-03): Kreditkartencheck
+    via Stripe SetupIntent. Verifiziert echte Kreditkarte OHNE Abbuchung = 18+ Nachweis.
     Kosten: 0€ (SetupIntent ist kostenlos).
     Nexus speichert: KEINE Kartendaten! Nur verified_stripe: true."""
 
     name = "stripe"
-    level = 1
+    level = 2
 
     def available(self) -> bool:
         if not HAS_STRIPE:
@@ -3414,13 +4207,13 @@ class StripeSetupIntentProvider(VerificationProvider):
 
 
 class VeriffIDProvider(VerificationProvider):
-    """Stufe 2: Perso-Verifikation via Veriff (oder IDnow).
+    """Stufe 3 (5-Stufen-Schema, Hasi-Diktat 2026-05-03): Perso-Verifikation via Veriff (oder IDnow).
     Perso scannen + Gesicht abgleichen = echte Identität bestätigt.
     Kosten: 1-2€ pro Verifikation (User zahlt).
     Nexus speichert: KEINE Perso-Daten! Nur id_verified: true."""
 
     name = "veriff"
-    level = 2
+    level = 3
 
     def available(self) -> bool:
         cfg = load_config()
@@ -3678,6 +4471,16 @@ def _create_verification_license(subject_sid: str, subject_name: str, provider: 
     except Exception as e:
         nexus_log(f"⚠️ Lizenz-Erzeugung fehlgeschlagen: {type(e).__name__}: {e}", "red")
         return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SHINSHARE-OWNER-LIZENZ — RAUSGENOMMEN 2026-05-04 (Day113 Phase 2 Rückbau)
+#
+# Programme bekommen jetzt Tokens via Pair-Exchange-System (siehe
+# _connections, vorschuss_roll_for_user, refresh_token_for_app).
+# Die Owner-Identität liegt direkt im Account-Vault (_identity), keine
+# eigene "ShinShare-Owner-Lizenz" mehr.
+# ═══════════════════════════════════════════════════════════════════════════
 
 
 LICENSE_GRACE_PERIOD_DAYS = 7
@@ -4642,6 +5445,120 @@ def _btc_wallet_anchor_hash(code_hash: str, version: str) -> dict | None:
     except Exception as e:
         nexus_log(f"⚠️ BTC Blockchain-Eintrag fehlgeschlagen: {e}", "red")
         return None
+
+
+def _btc_wallet_anchor_hash_sister(app_name: str, version: str, code_hash: str) -> dict | None:
+    """Sister-App-Anchor — Code-Hash einer Schwester-App in die Blockchain.
+    OP_RETURN-Format: SHINPAI-AI:<app>:<version>:<hash24>  (max 80 Bytes).
+    Hasi-Diktat 2026-05-06 (Doku Kapitel 10.4).
+    """
+    wallet = _btc_wallet_load()
+    if not wallet or not wallet.get("wif"):
+        return None
+    try:
+        from bitcoinutils.setup import setup
+        from bitcoinutils.keys import PrivateKey
+        from bitcoinutils.transactions import Transaction, TxInput, TxOutput, TxWitnessInput
+        from bitcoinutils.script import Script
+        import urllib.request
+        setup("mainnet")
+
+        pk = PrivateKey.from_wif(wallet["wif"])
+        pub = pk.get_public_key()
+        addr = pub.get_segwit_address()
+        addr_str = addr.to_string()
+
+        utxo_url = f"https://mempool.space/api/address/{addr_str}/utxo"
+        with urllib.request.urlopen(utxo_url, timeout=15) as resp:
+            utxos = json.loads(resp.read())
+        if not utxos:
+            nexus_log("⚠️ BTC Sister: Keine UTXOs", "yellow")
+            return None
+
+        utxo = max(utxos, key=lambda u: u["value"])
+        txin = TxInput(utxo["txid"], utxo["vout"])
+
+        # OP_RETURN für Sister: SHINPAI-AI:<app>:<version>:<hash24>
+        # Hash auf 24 hex Zeichen kürzen damit's mit App-Name unter 80 Bytes bleibt
+        op_data = f"SHINPAI-AI:{app_name}:{version}:{code_hash[:24]}".encode("utf-8")
+        if len(op_data) > 80:
+            op_data = op_data[:80]
+
+        fee_sats, sat_per_vb = _btc_estimate_fee_sats()
+        change = utxo["value"] - fee_sats
+        if change < 0:
+            nexus_log(f"⚠️ BTC Sister: Nicht genug Sats", "yellow")
+            return None
+
+        op_return_out = TxOutput(0, Script(["OP_RETURN", op_data.hex()]))
+        change_out = TxOutput(change, addr.to_script_pub_key())
+        tx = Transaction([txin], [op_return_out, change_out], has_segwit=True)
+        script_code = Script(["OP_DUP", "OP_HASH160", pub.to_hash160(),
+                              "OP_EQUALVERIFY", "OP_CHECKSIG"])
+        sig = pk.sign_segwit_input(tx, 0, script_code, utxo["value"])
+        tx.witnesses.append(TxWitnessInput([sig, pub.to_hex()]))
+
+        raw_tx = tx.serialize()
+        broadcast_url = "https://mempool.space/api/tx"
+        req = urllib.request.Request(broadcast_url, data=raw_tx.encode("utf-8"),
+                                     headers={"Content-Type": "text/plain"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            txid = resp.read().decode("utf-8").strip()
+
+        entry = {
+            "txid": txid,
+            "code_hash": code_hash,
+            "version": version,
+            "app_name": app_name,
+            "timestamp": int(time.time()),
+            "address": addr_str,
+            "op_return": op_data.decode("utf-8"),
+            "fee_sats": fee_sats,
+            "status": "pending",
+        }
+        wallet.setdefault("entries", []).append(entry)
+        # Sister-Anker landet auch im pending — teilt sich mit eigenem Anker
+        # die UTXO-Pipeline; via app_name unterscheidbar.
+        wallet["pending_anchor"] = entry
+        _btc_wallet_save(wallet)
+        nexus_log(f"₿ Sister-Anchor: {app_name} v{version} → {txid[:16]}... ({fee_sats} sats)", "cyan")
+        return entry
+
+    except Exception as e:
+        nexus_log(f"⚠️ BTC Sister-Anchor fehlgeschlagen: {e}", "red")
+        return None
+
+
+def _btc_write_anchor_json_sister(app_name: str, entry: dict) -> None:
+    """Schreibt anchor-<app_name>.json analog zu _btc_write_anchor_json."""
+    target = BASE / f"anchor-{app_name}.json"
+    existing = {}
+    if target.exists():
+        try:
+            existing = json.loads(target.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+    history = existing.get("history", [])
+    if existing.get("txid") and existing.get("txid") != entry.get("txid"):
+        history.insert(0, {k: existing.get(k) for k in
+                           ("txid", "code_hash", "version", "timestamp",
+                            "btc_address", "op_return", "fee_sats")})
+    new_anchor = {
+        "version": entry.get("version", ""),
+        "code_hash": entry.get("code_hash", ""),
+        "txid": entry.get("txid", ""),
+        "btc_address": entry.get("address", ""),
+        "timestamp": entry.get("timestamp", 0),
+        "op_return": entry.get("op_return", ""),
+        "company": existing.get("company") or "Shinpai-AI",
+        "app_name": app_name,
+        "revoked": False,
+        "history": history[:20],
+    }
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(new_anchor, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(target)
+    nexus_log(f"📜 anchor-{app_name}.json geschrieben (txid={entry.get('txid','')[:16]}…)", "green")
 
 
 def _btc_wallet_revoke(code_hash: str) -> dict | None:
@@ -5871,6 +6788,8 @@ _SENSITIVE_ENDPOINTS = {
     "/api/agent/create", "/api/agent/delete",
     "/api/verify/start", "/api/verify/callback", "/api/verify/reset",
     "/api/stripe/config",
+    "/api/paypal/config",
+    "/api/owner/resign-licenses",
     "/api/veriff/config",
     "/api/veriff/toggle",
     "/api/veriff/price",
@@ -5894,6 +6813,14 @@ _SENSITIVE_ENDPOINTS = {
     "/api/auth/seed-unlock",
     "/api/auth/pw-reset-set",
     "/api/auth/seed-refresh",
+    "/api/account/pair/start",
+    "/api/account/pair/exchange",
+    "/api/account/connections/revoke",
+    "/api/account/vorschuss/roll",
+    "/api/account/connections/refresh",
+    "/api/account/connections/owner-resume",
+    "/api/account/pair/request/approve",
+    "/api/account/pair/request/deny",
 }
 
 # Auth-geschützte Endpoints — brauchen 2FA wenn aktiviert
@@ -5918,6 +6845,250 @@ def _auth_success(ip: str):
 
 def _auth_locked(ip: str) -> bool:
     return _auth_fails.get(ip, 0) >= _AUTH_MAX_FAILS
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  PAYMENT HUB — PayPal REST v2 Helper (urllib-direkt, kein SDK)
+#
+#  Analog zu strike_payment.py in ShinShare: schlanker Wrapper gegen
+#  api-m.paypal.com bzw api-m.sandbox.paypal.com. Zentral hier in Nexus
+#  weil Sister-Apps (ShinShare etc.) Payment via /api/payment/sister-checkout
+#  nutzen — Nexus = Payment-Hub, ein Account, eine Webhook-URL.
+#
+#  Auth: OAuth2 client_credentials → access_token (Cache mit Expiry).
+#  Webhook-Verify: PayPal-eigener Verify-Endpoint (keine HMAC wie Stripe).
+# ══════════════════════════════════════════════════════════════════════
+
+# Access-Token-Cache (Modul-level): {"token": "...", "expires_at": <ts>}
+_paypal_token_cache: dict = {"token": "", "expires_at": 0.0}
+
+# PayPal ist ohne SDK callable — HAS_PAYPAL spiegelt nur ob Config vollständig ist
+HAS_PAYPAL = True
+
+
+def _paypal_base_url(cfg: dict) -> str:
+    """Sandbox vs Live abhängig von paypal_mode in Config (default: sandbox)."""
+    mode = (cfg.get("paypal_mode") or "sandbox").lower()
+    if mode == "live":
+        return "https://api-m.paypal.com"
+    return "https://api-m.sandbox.paypal.com"
+
+
+def _paypal_get_access_token(cfg: dict) -> str:
+    """OAuth2 client_credentials → access_token. Cached bis kurz vor Expiry."""
+    global _paypal_token_cache
+    now = time.time()
+    cached = _paypal_token_cache
+    if cached.get("token") and cached.get("expires_at", 0) > now + 30:
+        return cached["token"]
+
+    client_id = cfg.get("paypal_client_id", "")
+    client_secret = cfg.get("paypal_client_secret", "")
+    if not client_id or not client_secret:
+        raise RuntimeError("paypal_client_id/paypal_client_secret nicht konfiguriert")
+
+    base = _paypal_base_url(cfg)
+    auth_raw = f"{client_id}:{client_secret}".encode("utf-8")
+    auth_b64 = base64.b64encode(auth_raw).decode("ascii")
+
+    import urllib.request as _ur
+    import urllib.error as _ue
+    req = _ur.Request(
+        f"{base}/v1/oauth2/token",
+        data=b"grant_type=client_credentials",
+        headers={
+            "Authorization": f"Basic {auth_b64}",
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    try:
+        with _ur.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except _ue.HTTPError as e:
+        msg = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"PayPal-Auth HTTP {e.code}: {msg}") from e
+
+    token = body.get("access_token", "")
+    expires_in = int(body.get("expires_in", 3600))
+    if not token:
+        raise RuntimeError("PayPal-Auth: kein access_token in Response")
+    _paypal_token_cache = {"token": token, "expires_at": now + expires_in}
+    return token
+
+
+def _paypal_request(cfg: dict, method: str, path: str, body: dict | None = None) -> dict:
+    """Wrappt PayPal-API-Calls mit Bearer-Auth. Liefert dict (oder leer dict bei 204)."""
+    import urllib.request as _ur
+    import urllib.error as _ue
+    token = _paypal_get_access_token(cfg)
+    base = _paypal_base_url(cfg)
+    url = f"{base}{path}"
+    data = None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+    req = _ur.Request(url, data=data, headers=headers, method=method.upper())
+    try:
+        with _ur.urlopen(req, timeout=15) as resp:
+            raw = resp.read()
+            if not raw:
+                return {}
+            return json.loads(raw.decode("utf-8"))
+    except _ue.HTTPError as e:
+        msg = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"PayPal {method} {path} HTTP {e.code}: {msg}") from e
+
+
+def _paypal_create_order(cfg: dict, item_name: str, amount_cents: int,
+                         currency: str, success_url: str, cancel_url: str,
+                         metadata: dict, reference_id: str) -> dict:
+    """Erstellt PayPal-Order. Liefert {order_id, approve_url, raw}."""
+    # PayPal will Beträge als Strings mit fixen Dezimalen (EUR=2)
+    amount_str = f"{amount_cents / 100:.2f}"
+    # custom_id transportiert unser Metadata über den ganzen Flow (max 127 Zeichen)
+    custom_id = json.dumps(metadata, separators=(",", ":"))[:127]
+    order_body = {
+        "intent": "CAPTURE",
+        "purchase_units": [{
+            "reference_id": reference_id[:256],
+            "description": item_name[:127],
+            "amount": {
+                "currency_code": currency.upper(),
+                "value": amount_str,
+            },
+            "custom_id": custom_id,
+        }],
+        "application_context": {
+            "return_url": success_url,
+            "cancel_url": cancel_url,
+            "user_action": "PAY_NOW",
+            "shipping_preference": "NO_SHIPPING",
+            "brand_name": "ShinNexus",
+        },
+    }
+    resp = _paypal_request(cfg, "POST", "/v2/checkout/orders", order_body)
+    order_id = resp.get("id", "")
+    approve_url = ""
+    for link in resp.get("links", []) or []:
+        if link.get("rel") == "approve":
+            approve_url = link.get("href", "")
+            break
+    if not order_id or not approve_url:
+        raise RuntimeError(f"PayPal-Order ohne id/approve_url: {resp}")
+    return {"order_id": order_id, "approve_url": approve_url, "raw": resp}
+
+
+def _paypal_get_order(cfg: dict, order_id: str) -> dict:
+    """Liest aktuellen Order-Status (Auto-Bestätigung im Webhook)."""
+    return _paypal_request(cfg, "GET", f"/v2/checkout/orders/{order_id}")
+
+
+def _paypal_verify_webhook(cfg: dict, headers, raw_body: bytes) -> bool:
+    """Verifiziert PayPal-Webhook via Verify-Endpoint.
+
+    PayPal nutzt asymmetrische Cert-basierte Signatur (kein HMAC). Wir reichen
+    Headers + Event-Body + webhook_id an PayPal weiter, die antworten mit
+    'verification_status': 'SUCCESS'/'FAILURE'.
+    """
+    webhook_id = cfg.get("paypal_webhook_id", "")
+    if not webhook_id:
+        nexus_log("⚠️ PayPal-Webhook: paypal_webhook_id nicht konfiguriert", "yellow")
+        return False
+    try:
+        event = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return False
+    verify_body = {
+        "auth_algo": headers.get("Paypal-Auth-Algo", "") or headers.get("PAYPAL-AUTH-ALGO", ""),
+        "cert_url": headers.get("Paypal-Cert-Url", "") or headers.get("PAYPAL-CERT-URL", ""),
+        "transmission_id": headers.get("Paypal-Transmission-Id", "") or headers.get("PAYPAL-TRANSMISSION-ID", ""),
+        "transmission_sig": headers.get("Paypal-Transmission-Sig", "") or headers.get("PAYPAL-TRANSMISSION-SIG", ""),
+        "transmission_time": headers.get("Paypal-Transmission-Time", "") or headers.get("PAYPAL-TRANSMISSION-TIME", ""),
+        "webhook_id": webhook_id,
+        "webhook_event": event,
+    }
+    try:
+        resp = _paypal_request(cfg, "POST", "/v1/notifications/verify-webhook-signature", verify_body)
+    except Exception as e:
+        nexus_log(f"❌ PayPal-Webhook-Verify-Call fehlgeschlagen: {e}", "red")
+        return False
+    return resp.get("verification_status") == "SUCCESS"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  DEEPLINK — Cross-App-Sprung mit Login-Bridge
+#
+#  Sister-App (ShinShare etc.) callt POST /api/deeplink/issue mit ihrem
+#  Connection-Token + Action-Name. Nexus generiert kurzlebigen Code
+#  (5 Min, single-use), Sister leitet Browser auf
+#  /deeplink/open?code=... → Nexus setzt Auth-Session-Cookie + öffnet
+#  die richtige Section.
+#
+#  Drei-Schichten-Vertrauen (Hasi-Diktat 2026-05-06):
+#    - Whitelist (Code-Hash + BTC-TXID) bestätigt Nexus-Echtheit
+#    - Connection-Token (Pair-Exchange) bestätigt User-Identität
+#    - Deeplink-Code (5 Min, single-use, action-bound) bestätigt Click-Intent
+# ══════════════════════════════════════════════════════════════════════
+
+# Action-Whitelist: action-name → wohin in der UI
+# owner_only: True heißt nur der Server-Owner darf hin (Marketplace-Settings)
+DEEPLINK_ACTIONS = {
+    "stripe-config":       {"tab": "server", "edit": "stripe", "owner_only": True,  "label": "Stripe konfigurieren"},
+    "paypal-config":       {"tab": "server", "edit": "paypal", "owner_only": True,  "label": "PayPal konfigurieren"},
+    "smtp-config":         {"tab": "server", "edit": "smtp",   "owner_only": True,  "label": "SMTP konfigurieren"},
+    "server-status":       {"tab": "server",              "owner_only": True,  "label": "Server-Status"},
+    "lizenz-verwalten":    {"tab": "lizenzen",            "owner_only": False, "label": "Lizenzen verwalten"},
+    "amt-beantragen":      {"tab": "verifikation",        "owner_only": False, "label": "Amt beantragen"},
+    "verifikation":        {"tab": "verifikation",        "owner_only": False, "label": "Verifikation"},
+    "programme-vertrauen": {"tab": "verbunden",           "owner_only": False, "label": "Verbundene Programme"},
+    "sicherheit":          {"tab": "sicherheit",          "owner_only": False, "label": "Sicherheits-Tab"},
+}
+
+DEEPLINK_TTL_SECONDS = 5 * 60  # 5 Minuten — kurz genug gegen Diebstahl
+_deeplink_codes: dict = {}  # {code: {"shinpai_id", "action", "is_owner", "expires_at", "used"}}
+
+
+def _deeplink_code_create(shinpai_id: str, action: str, is_owner: bool) -> str:
+    """Erzeugt einen frischen Deeplink-Code mit kurzer TTL, single-use."""
+    code = secrets.token_urlsafe(24)
+    _deeplink_codes[code] = {
+        "shinpai_id": shinpai_id,
+        "action":     action,
+        "is_owner":   bool(is_owner),
+        "expires_at": int(time.time()) + DEEPLINK_TTL_SECONDS,
+        "used":       False,
+    }
+    _deeplink_codes_cleanup()
+    return code
+
+
+def _deeplink_code_consume(code: str) -> dict | None:
+    """Single-use Lookup: liefert Code-Daten + markiert als used. None wenn ungültig/abgelaufen."""
+    rec = _deeplink_codes.get(code)
+    if not rec:
+        return None
+    if rec["used"]:
+        return None
+    if time.time() > rec["expires_at"]:
+        _deeplink_codes.pop(code, None)
+        return None
+    rec["used"] = True  # single-use: nach erstem Lookup nicht mehr gültig
+    return rec
+
+
+def _deeplink_codes_cleanup() -> None:
+    """Räumt abgelaufene/verbrauchte Codes auf — wird bei jedem Create aufgerufen."""
+    now = time.time()
+    expired = [c for c, r in _deeplink_codes.items()
+               if r["used"] or now > r["expires_at"]]
+    for c in expired:
+        _deeplink_codes.pop(c, None)
 
 
 class ThreadedServer(ThreadingMixIn, HTTPServer):
@@ -5949,10 +7120,14 @@ class NexusHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _session_cookie_header(self, token: str, max_age: int = 86400 * 7):
-        """Set-Cookie-Header für nexus_session mit HttpOnly + Secure + SameSite=Strict.
-        XSS-Hardening 2026-04-30: Cookie ist nicht mehr JS-lesbar."""
-        return ("Set-Cookie", f"nexus_session={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age}")
+    def _session_cookie_header(self, token: str, max_age: int = 86400 * 7, cross_site: bool = False):
+        """Set-Cookie-Header für nexus_session mit HttpOnly + Secure + SameSite.
+        XSS-Hardening 2026-04-30: Cookie ist nicht mehr JS-lesbar.
+        cross_site=True: SameSite=Lax (für Deeplinks aus Sister-App-Origin —
+        Top-Level-Navigation darf den Cookie senden, POST-CSRF bleibt geblockt).
+        cross_site=False: SameSite=Strict (Default für Same-Origin-Logins)."""
+        same_site = "Lax" if cross_site else "Strict"
+        return ("Set-Cookie", f"nexus_session={token}; Path=/; HttpOnly; Secure; SameSite={same_site}; Max-Age={max_age}")
 
     def _session_cookie_clear(self):
         return ("Set-Cookie", "nexus_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0")
@@ -6046,6 +7221,12 @@ class NexusHandler(BaseHTTPRequestHandler):
             self._handle_whitelist_get()
         elif path == "/api/public/bot-policy":
             self._handle_bot_policy_get()
+        elif path == "/api/account/connections":
+            self._handle_connections_list()
+        elif path == "/api/account/pair/request":
+            self._handle_pair_request_get()
+        elif path == "/api/account/pair/poll":
+            self._handle_pair_poll()
         elif path == "/api/account/type":
             self._handle_account_type_status()
         elif path == "/api/owner/members":
@@ -6133,6 +7314,10 @@ class NexusHandler(BaseHTTPRequestHandler):
             self._handle_chain_info()
         elif path == "/api/server/status":
             self._handle_server_status()
+        elif path == "/api/payment/status":
+            self._handle_payment_status()
+        elif path == "/deeplink/open":
+            self._handle_deeplink_open()
         elif path == "/api/amt-lists":
             self._handle_amt_lists_get()
         elif path == "/api/amt-lists/amter":
@@ -6212,8 +7397,13 @@ class NexusHandler(BaseHTTPRequestHandler):
             record["email_verified"] = True
             record["verify_token"] = ""
             record["verify_expires"] = 0
+            # Stufe 1 (5-Stufen-Schema): Email-verifiziert = "Verbunden"
+            if int(record.get("verification_level", 0) or 0) < 1:
+                record["verification_level"] = 1
+                record["verified_at"] = int(time.time())
+                record["verified_by"] = "email"
             save_fn()
-            nexus_log(f"✅ EMAIL VERIFIED via code — {label}", "green")
+            nexus_log(f"✅ EMAIL VERIFIED via code — {label} (Lvl 1 'Verbunden')", "green")
             return True, "Email verifiziert!"
 
         # Owner pruefen
@@ -6401,6 +7591,26 @@ class NexusHandler(BaseHTTPRequestHandler):
             self._handle_dm_ack()
         elif path == "/api/auth/public-keys":
             self._handle_public_keys_update()
+        elif path == "/api/account/pair/start":
+            self._handle_pair_start()
+        elif path == "/api/account/pair/exchange":
+            self._handle_pair_exchange()
+        elif path == "/api/account/connections/revoke":
+            self._handle_connection_revoke()
+        elif path == "/api/account/connections/revoke-self":
+            self._handle_connection_revoke_self()
+        elif path == "/api/account/vorschuss/roll":
+            self._handle_vorschuss_roll()
+        elif path == "/api/account/connections/refresh":
+            self._handle_connection_refresh()
+        elif path == "/api/account/connections/owner-resume":
+            self._handle_owner_resume()
+        elif path == "/api/account/pair/request":
+            self._handle_pair_request_create()
+        elif path == "/api/account/pair/request/approve":
+            self._handle_pair_request_approve()
+        elif path == "/api/account/pair/request/deny":
+            self._handle_pair_request_deny()
         elif path == "/api/owner/igni":
             self._handle_owner_igni_set()
         elif path == "/api/owner/bot-quota":
@@ -6427,6 +7637,8 @@ class NexusHandler(BaseHTTPRequestHandler):
             self._handle_btc_wallet_import()
         elif path == "/api/btc/anchor":
             self._handle_btc_anchor()
+        elif path == "/api/btc/anchor/sister":
+            self._handle_btc_anchor_sister()
         elif path == "/api/btc/revoke":
             self._handle_btc_revoke()
         elif path == "/api/verify/reset":
@@ -6437,6 +7649,20 @@ class NexusHandler(BaseHTTPRequestHandler):
             self._handle_veriff_webhook()
         elif path == "/api/stripe/config":
             self._handle_stripe_config()
+        elif path == "/api/paypal/config":
+            self._handle_paypal_config()
+        elif path == "/api/payment/sister-checkout":
+            self._handle_payment_sister_checkout()
+        elif path == "/api/payment/sister-confirm":
+            self._handle_payment_sister_confirm()
+        elif path == "/api/payment/stripe-webhook":
+            self._handle_payment_stripe_webhook()
+        elif path == "/api/payment/paypal-webhook":
+            self._handle_payment_paypal_webhook()
+        elif path == "/api/deeplink/issue":
+            self._handle_deeplink_issue()
+        elif path == "/api/owner/resign-licenses":
+            self._handle_resign_licenses()
         elif path == "/api/veriff/config":
             self._handle_veriff_config()
         elif path == "/api/veriff/toggle":
@@ -6864,6 +8090,7 @@ class NexusHandler(BaseHTTPRequestHandler):
         _load_agents()
         _load_users()
         _load_user_hives()
+        _load_connections()
         # 2FA Prüfung wenn aktiviert
         if _identity and _identity.get("totp_confirmed"):
             if not totp_code:
@@ -7671,9 +8898,12 @@ class NexusHandler(BaseHTTPRequestHandler):
             cfg["mode"] = "server"
             cfg["domain"] = data.get("domain", cfg.get("domain", ""))
             cfg["public_url"] = data.get("public_url", cfg.get("public_url", ""))
-            # SMTP übernehmen wenn mitgeschickt
+            # SMTP übernehmen wenn mitgeschickt — PW separat ins Vault (nach vault-init)
+            _pending_smtp_pw = ""
             if data.get("smtp"):
-                cfg["smtp"] = data["smtp"]
+                smtp_data = dict(data["smtp"])
+                _pending_smtp_pw = smtp_data.pop("password", "") or ""
+                cfg["smtp"] = smtp_data
             save_config(cfg)
             # Igni erstellen — nur wenn owner_vault_mode=standard (Default)
             _igni_init(cfg)
@@ -7681,6 +8911,9 @@ class NexusHandler(BaseHTTPRequestHandler):
                 igni_save(password)
             # System Vault (machine-bound composite)
             system_vault_init(cfg, owner_password=password)
+            # SMTP-PW jetzt sicher in Vault speichern (Vault ist offen)
+            if _pending_smtp_pw:
+                _save_smtp_password(_pending_smtp_pw)
             # Platzhalter jetzt verwerfen — echter Owner übernimmt
             _placeholder_dismiss()
             nexus_log(f"👑 AUTO-OWNER CREATED via API", "green")
@@ -7975,14 +9208,20 @@ class NexusHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "JSON erforderlich"}, 400)
             return
         cfg = load_config()
+        # PW separat ins Vault — niemals plain im Config-JSON.
+        # Wenn data["password"] leer: bestehender Vault-PW bleibt unverändert.
+        new_pw = data.get("password", "") or ""
         cfg["smtp"] = {
             "host": data.get("host", "").strip(),
             "port": int(data.get("port", 587)),
             "user": data.get("user", "").strip(),
-            "password": data.get("password", ""),
             "from": data.get("from", "").strip() or data.get("user", "").strip(),
         }
         save_config(cfg)
+        if new_pw:
+            if not _save_smtp_password(new_pw):
+                self._send_json({"error": "Vault zu — SMTP-PW konnte nicht gespeichert werden"}, 503)
+                return
         NexusHandler.config = cfg  # Class-Config synchron halten!
         nexus_log(f"📧 SMTP konfiguriert: {cfg['smtp']['host']}", "green")
         # Test-Mail?
@@ -8330,6 +9569,23 @@ class NexusHandler(BaseHTTPRequestHandler):
     _2fa_pending: dict = {}           # {sid: {new_secret, new_seed, expires, username, is_owner}} — aktives 10min-Fenster
     _2FA_WINDOW_TTL = 600             # 10 Minuten Code-Eingabe-Fenster
     _2FA_MAX_WINDOWS_PER_7D = 3       # max 3 Fenster pro 7 Tage
+
+    def _handle_resign_licenses(self):
+        """POST /api/owner/resign-licenses — Re-Signiert alle vom Owner ausgestellten Lizenzen
+        mit dem aktuellen Owner-PQ-Key. Owner-only, TLS-geschützt.
+
+        Use-Case: nach PQ-Key-Rotation (z.B. Owner-Migrate) sind alte Signaturen ungültig —
+        dieser Endpoint repariert das in einem Rutsch. Lizenzen von anderen Nexussen
+        empfangen werden nicht angefasst (keine fremden Private-Keys hier).
+        """
+        session = self._require_auth()
+        if not session:
+            return
+        if not _identity or session.get("shinpai_id") != _identity.get("shinpai_id"):
+            self._send_json({"error": "Nur Owner darf Lizenzen re-signieren"}, 403)
+            return
+        result = _resign_owner_issued_licenses()
+        self._send_json(result)
 
     def _handle_2fa_refresh(self):
         """POST /api/auth/2fa-refresh — Neues 2FA-Secret + neuer Recovery-Seed per Email.
@@ -9354,6 +10610,335 @@ class NexusHandler(BaseHTTPRequestHandler):
             "kem_public_key": contact.get("kem_public_key", ""),
         })
 
+    # ══════════════════════════════════════════════════════════════════
+    #  PAIR-API HANDLERS — Verbundene Programme verwalten
+    # ══════════════════════════════════════════════════════════════════
+
+    def _handle_pair_start(self):
+        """POST /api/account/pair/start — User generiert Pair-Code für eine App."""
+        session = self._require_auth()
+        if not session:
+            return
+        if not vault_is_unlocked():
+            self._send_json({"error": "Vault nicht entsperrt"}, 503)
+            return
+        data = self._parse_json() or {}
+        label_hint = data.get("label_hint", "")
+        try:
+            result = pair_start_for_user(
+                shinpai_id=session.get("shinpai_id", ""),
+                username=session.get("name", ""),
+                label_hint=label_hint,
+            )
+            self._send_json(result)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, 429)
+
+    def _handle_pair_exchange(self):
+        """POST /api/account/pair/exchange — App löst Pair-Code ein.
+
+        Body: {code, source_app, source_url?, source_version?, machine_id?}
+        Auth: KEINE — der Code IST die Auth.
+        machine_id wird gespeichert für Refresh-Härtung (Phase 6).
+        """
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            self._send_json({"error": "Zu viele Pairing-Versuche — warten"}, 429)
+            return
+        data = self._parse_json() or {}
+        code = (data.get("code") or "").strip()
+        source_app = (data.get("source_app") or "").strip()[:40]
+        source_url = (data.get("source_url") or "").strip()[:200]
+        source_version = (data.get("source_version") or "").strip()[:40]
+        machine_id = (data.get("machine_id") or "").strip()[:128]
+        if not code:
+            self._send_json({"error": "code Pflicht"}, 400)
+            return
+        if not source_app:
+            self._send_json({"error": "source_app Pflicht"}, 400)
+            return
+        try:
+            result = pair_exchange(code, source_app, source_url, source_version,
+                                   machine_id=machine_id)
+            self._send_json(result)
+        except ValueError as e:
+            msg = str(e)
+            status = 410 if "verfallen" in msg or "eingelöst" in msg else 401
+            self._send_json({"error": msg}, status)
+
+    def _handle_connections_list(self):
+        """GET /api/account/connections — eigene aktive Connections."""
+        session = self._require_auth()
+        if not session:
+            return
+        if not vault_is_unlocked():
+            self._send_json({"error": "Vault nicht entsperrt"}, 503)
+            return
+        connections = list_user_connections(session.get("shinpai_id", ""))
+        self._send_json({"connections": connections, "count": len(connections)})
+
+    def _handle_connection_revoke(self):
+        """POST /api/account/connections/revoke {connection_id, reason?, password?, totp_code?, confirm_destructive?}
+        Owner-Revoke via Session — User klickt in Nexus-UI auf 🗑.
+
+        Hasi-Diktat 2026-05-05 (Trick 17 Owner-Lösch-Schutz):
+        Wenn die Ziel-Connection eine Owner-Connection ist, wird zusätzlich
+        password + totp_code + confirm_destructive=true verlangt. Ohne diese
+        Felder: 423 Locked mit klarer Warnung dass der Vault auf Programm-Seite
+        damit unzugänglich werden kann.
+        """
+        session = self._require_auth()
+        if not session:
+            return
+        data = self._parse_json() or {}
+        connection_id = (data.get("connection_id") or "").strip()
+        reason = (data.get("reason") or "owner_initiated").strip()[:60]
+        if not connection_id:
+            self._send_json({"error": "connection_id Pflicht"}, 400)
+            return
+
+        target = _connections.get(connection_id)
+        is_owner_target = bool(target and target.get("verification_level") == "owner")
+
+        force_flag = False
+        if is_owner_target:
+            password = (data.get("password") or "").strip()
+            totp_code = (data.get("totp_code") or "").strip()
+            confirm = bool(data.get("confirm_destructive"))
+            if not (password and confirm):
+                self._send_json({
+                    "error": "Owner-Lösch-Schutz aktiv",
+                    "owner_protected": True,
+                    "warning": "Diese Connection gehört zu einem Owner-Programm. Löschen sperrt den Vault auf der Programm-Seite ohne Recovery-Seed/Igni dauerhaft. Bestätigung mit password + totp_code + confirm_destructive=true Pflicht.",
+                }, 423)
+                return
+            if not _verify_owner_password(password):
+                _auth_fail(self._client_ip())
+                self._send_json({"error": "Authentifizierung fehlgeschlagen"}, 401)
+                return
+            if _identity and _identity.get("totp_confirmed"):
+                if not totp_code or not totp_verify(_identity.get("totp_secret", ""), totp_code):
+                    _auth_fail(self._client_ip())
+                    self._send_json({"error": "2FA-Code falsch"}, 401)
+                    return
+            force_flag = True
+
+        ok = revoke_connection(connection_id,
+                               by_shinpai_id=session.get("shinpai_id", ""),
+                               reason=reason,
+                               force_owner_destructive=force_flag)
+        if not ok:
+            self._send_json({"error": "Connection nicht gefunden oder nicht autorisiert"}, 404)
+            return
+        self._send_json({"ok": True, "revoked_at": int(time.time()), "owner_destructive": force_flag})
+
+    def _handle_pair_request_get(self):
+        """GET /api/account/pair/request?request_id=pf-... — App-seitige Lookup
+        damit der Browser-Tab im Nexus weiß was da bestätigt werden soll."""
+        request_id = parse_qs(urlparse(self.path).query).get("request_id", [""])[0]
+        info = pair_request_get(request_id)
+        if not info:
+            self._send_json({"error": "request_id ungültig oder verfallen"}, 410)
+            return
+        self._send_json(info)
+
+    def _handle_pair_request_create(self):
+        """POST /api/account/pair/request — vom Nexus-Frontend wenn User auf Approve-URL landet."""
+        data = self._parse_json() or {}
+        request_id = (data.get("request_id") or "").strip()
+        source_app = (data.get("source_app") or "").strip()
+        source_url = (data.get("source_url") or "").strip()
+        if not request_id:
+            self._send_json({"error": "request_id Pflicht"}, 400)
+            return
+        try:
+            info = pair_request_create(request_id, source_app, source_url)
+            self._send_json(info)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, 400)
+
+    def _handle_pair_request_approve(self):
+        """POST /api/account/pair/request/approve {request_id, label_hint?} — User-Auth."""
+        session = self._require_auth()
+        if not session:
+            return
+        if not vault_is_unlocked():
+            self._send_json({"error": "Vault nicht entsperrt"}, 503)
+            return
+        data = self._parse_json() or {}
+        request_id = (data.get("request_id") or "").strip()
+        label_hint = data.get("label_hint", "")
+        if not request_id:
+            self._send_json({"error": "request_id Pflicht"}, 400)
+            return
+        try:
+            result = pair_request_approve(
+                request_id=request_id,
+                user_shinpai_id=session.get("shinpai_id", ""),
+                username=session.get("name", ""),
+                label_hint=label_hint,
+            )
+            self._send_json(result)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, 400)
+
+    def _handle_pair_request_deny(self):
+        """POST /api/account/pair/request/deny {request_id} — User-Auth."""
+        session = self._require_auth()
+        if not session:
+            return
+        data = self._parse_json() or {}
+        request_id = (data.get("request_id") or "").strip()
+        if not request_id:
+            self._send_json({"error": "request_id Pflicht"}, 400)
+            return
+        try:
+            result = pair_request_deny(request_id)
+            self._send_json(result)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, 400)
+
+    def _handle_pair_poll(self):
+        """GET /api/account/pair/poll?request_id=pf-... — App pollt, KEINE Auth nötig
+        (Auth erfolgt durch Wissen der request_id, die ist secret-gleich)."""
+        request_id = parse_qs(urlparse(self.path).query).get("request_id", [""])[0]
+        if not request_id:
+            self._send_json({"error": "request_id Pflicht"}, 400)
+            return
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            self._send_json({"error": "Rate limit"}, 429)
+            return
+        result = pair_request_poll(request_id)
+        self._send_json(result)
+
+    def _handle_vorschuss_roll(self):
+        """POST /api/account/vorschuss/roll — Würfelt Token-Refresh für ALLE eigenen Connections.
+        Cooldown 1x/24h. Alter Token bleibt aktiv bis App neuen abholt via /refresh.
+        """
+        session = self._require_auth()
+        if not session:
+            return
+        if not vault_is_unlocked():
+            self._send_json({"error": "Vault nicht entsperrt"}, 503)
+            return
+        try:
+            result = vorschuss_roll_for_user(session.get("shinpai_id", ""))
+            self._send_json({"ok": True, **result})
+        except ValueError as e:
+            self._send_json({"error": str(e)}, 429)
+
+    def _handle_connection_refresh(self):
+        """POST /api/account/connections/refresh — App holt sich pending Token ab.
+        Auth: Bearer alter connection_token.
+        Body: {machine_id} — Phase 6 Pflicht-Feld für Refresh-Härtung.
+
+        Wenn Vorschuss aktiv: alter Token wird in DIESEM Call invalidiert,
+        neuer Token im Response. App muss neuen sofort speichern (atomic write).
+        """
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            self._send_json({"error": "Rate limit"}, 429)
+            return
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            self._send_json({"error": "Bearer connection_token erforderlich"}, 401)
+            return
+        token = auth_header[len("Bearer "):].strip()
+        data = self._parse_json() or {}
+        machine_id = (data.get("machine_id") or "").strip()
+        try:
+            result = refresh_token_for_app(token, machine_id=machine_id)
+            self._send_json(result)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, 401)
+
+    def _handle_owner_resume(self):
+        """POST /api/account/connections/owner-resume — Trick 17 (Hasi-Diktat 2026-05-05).
+
+        Liefert den gespeicherten Klartext-Token der Owner-Connection für ein
+        Programm zurück, nachdem der Owner sich mit Passwort + 2FA authentifiziert
+        hat. Programm kann damit seinen Vault aufschließen ohne Igni.
+
+        Body: {password, totp_code, source_app}
+        Auth: Owner-Passwort + TOTP (2FA falls aktiv).
+        """
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            self._send_json({"error": "Rate limit"}, 429)
+            return
+        data = self._parse_json() or {}
+        password = (data.get("password") or "").strip()
+        totp_code = (data.get("totp_code") or "").strip()
+        source_app = (data.get("source_app") or "").strip()
+        if not password or not source_app:
+            self._send_json({"error": "password und source_app Pflicht"}, 400)
+            return
+        try:
+            result = owner_resume_for_app(source_app, password, totp_code)
+            self._send_json(result)
+        except RuntimeError as e:
+            if str(e) == "vault_locked":
+                self._send_json({"error": "Nexus-Vault gesperrt — Owner muss zuerst Nexus-Login machen"}, 503)
+            else:
+                self._send_json({"error": str(e)}, 500)
+        except ValueError as e:
+            err = str(e)
+            if err == "auth_failed" or err == "totp_failed":
+                _auth_fail(ip)
+                self._send_json({"error": "Authentifizierung fehlgeschlagen"}, 401)
+            elif err == "no_owner_connection":
+                self._send_json({"error": "Keine Owner-Connection für source_app — Pair-Exchange nötig"}, 404)
+            elif err == "no_identity":
+                self._send_json({"error": "Nexus hat keinen Owner — nicht initialisiert"}, 503)
+            else:
+                self._send_json({"error": err}, 400)
+
+    def _handle_connection_revoke_self(self):
+        """POST /api/account/connections/revoke-self {connection_id, reason?}
+        App-Self-Revoke via Bearer connection_token — App initiiert das Disconnect.
+
+        Hasi-Diktat 2026-05-05 (Trick 17 Owner-Lösch-Schutz):
+        Owner-Connections können sich NICHT selbst revoken — der Vault-Stop
+        muss über die Nexus-UI mit Owner-PW+2FA+confirm bestätigt werden.
+        Verhindert dass ein gehacktes/abgestürztes Owner-Programm seinen
+        eigenen Vault-Zugang killt.
+        """
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            self._send_json({"error": "Rate limit"}, 429)
+            return
+        data = self._parse_json() or {}
+        connection_id = (data.get("connection_id") or "").strip()
+        reason = (data.get("reason") or "app_initiated").strip()[:60]
+        if not connection_id:
+            self._send_json({"error": "connection_id Pflicht"}, 400)
+            return
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            self._send_json({"error": "Bearer connection_token erforderlich"}, 401)
+            return
+        token = auth_header[len("Bearer "):].strip()
+
+        target = _connections.get(connection_id)
+        if target and target.get("verification_level") == "owner":
+            self._send_json({
+                "error": "Owner-Lösch-Schutz: Self-Revoke nicht erlaubt",
+                "owner_protected": True,
+                "warning": "Owner-Connections können sich nicht selbst revoken. Nutze die Nexus-UI mit Owner-PW+2FA+confirm_destructive.",
+            }, 423)
+            return
+
+        ok = revoke_connection(connection_id, by_token=token, reason=reason)
+        if not ok:
+            self._send_json({"error": "Connection nicht gefunden oder Token ungültig"}, 401)
+            return
+        self._send_json({"ok": True, "revoked_at": int(time.time())})
+
+    # ══════════════════════════════════════════════════════════════════
+    #  /PAIR-API HANDLERS
+    # ══════════════════════════════════════════════════════════════════
+
     def _handle_public_keys_update(self):
         """POST /api/auth/public-keys — Eigene oeffentliche Keys aktualisieren.
 
@@ -10295,6 +11880,74 @@ class NexusHandler(BaseHTTPRequestHandler):
             return
         self._send_json({"ok": True, "entry": entry})
 
+    def _handle_btc_anchor_sister(self):
+        """POST /api/btc/anchor/sister — Sister-App-Anker via Pair-Bearer-Token.
+
+        Hasi-Diktat 2026-05-06 (Doku Kapitel 10.4 Phase 1):
+        Auth: Bearer connection_token (vom Pair-Exchange — Owner-Connection)
+        Body: {app_name, version, code_hash}
+        Schreibt OP_RETURN + anchor-{app_name}.json + auto-Whitelist-Eintrag.
+        """
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            self._send_json({"error": "Rate limit"}, 429)
+            return
+        # Auth: Bearer Connection-Token, MUSS einer Owner-Connection gehören
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            self._send_json({"error": "Bearer connection_token erforderlich"}, 401)
+            return
+        token = auth_header[len("Bearer "):].strip()
+        conn = find_connection_by_token(token)
+        if not conn:
+            self._send_json({"error": "Token ungültig oder revoked"}, 401)
+            return
+        if conn.get("verification_level") != "owner":
+            self._send_json({"error": "Sister-Anchor nur für Owner-Connections"}, 403)
+            return
+
+        data = self._parse_json() or {}
+        app_name = (data.get("app_name") or "").strip().lower()
+        version = (data.get("version") or "").strip()
+        code_hash = (data.get("code_hash") or "").strip().lower()
+        if not app_name or not version or not code_hash:
+            self._send_json({"error": "app_name, version, code_hash Pflicht"}, 400)
+            return
+        if not all(c in "0123456789abcdef" for c in code_hash) or len(code_hash) < 32:
+            self._send_json({"error": "code_hash ungültig (hex, ≥32 Zeichen)"}, 400)
+            return
+
+        # Lizenz-Prerequisite gleich wie eigener Anker
+        license_ok, license_missing = _license_anchor_prerequisites()
+        if not license_ok:
+            self._send_json({
+                "error": f"Lizenz-Daten unvollständig: {', '.join(license_missing)}",
+                "license_missing": license_missing,
+            }, 400)
+            return
+
+        # Duplikat-Check pro (app_name, code_hash)
+        w = _btc_wallet_load()
+        for e in w.get("entries", []):
+            if e.get("app_name") == app_name and e.get("code_hash") == code_hash:
+                self._send_json({"error": f"Hash für {app_name} bereits verankert",
+                                 "txid": e.get("txid")}, 409)
+                return
+
+        entry = _btc_wallet_anchor_hash_sister(app_name, version, code_hash)
+        if not entry:
+            self._send_json({"error": "Sister-Anker fehlgeschlagen. Wallet leer oder Netzwerk-Problem?"}, 500)
+            return
+
+        # anchor-{app}.json sofort schreiben (wird bei Confirmation aktualisiert)
+        try:
+            _btc_write_anchor_json_sister(app_name, entry)
+        except Exception as e:
+            nexus_log(f"⚠️ anchor-{app_name}.json Schreiben fehlgeschlagen: {e}", "red")
+
+        nexus_log(f"⚓ SISTER-ANCHOR ausgelöst von {conn.get('username')} → {app_name} v{version}", "green")
+        self._send_json({"ok": True, "entry": entry, "anchor_path": f"anchor-{app_name}.json"})
+
     def _handle_btc_anchor_status(self):
         """GET /api/btc/anchor/status — Bestätigungsstatus der letzten pending TX."""
         if not self._require_owner():
@@ -10524,19 +12177,22 @@ class NexusHandler(BaseHTTPRequestHandler):
 <script>
 var vl={vlevel},as={active_subs_js};
 var img=document.getElementById('s'),lb=document.getElementById('l');
-if(vl>=3){{
+if(vl>=4){{
   img.src='{shield_edel}';
   var gc=['#ff9090','#ff6060','#ee4040','#c82828','#8e1818','#ffe488','#f5c858','#d4a850','#a6822c','#6e5410','#88e896','#5bc870','#4caf50','#358a3a','#1b5e20','#9ed4f0','#7ab8e0','#5a9ed0','#3a7cbf','#1a5a9f','#d0a0ff','#b082ff','#aa78ff','#7e4ad0','#4e1c88'];
   var gi=0;setInterval(function(){{var c=gc[gi%25],c2=gc[(gi+1)%25];img.style.filter='drop-shadow(0 0 8px '+c+') drop-shadow(0 0 4px '+c2+') drop-shadow(0 0 14px '+c+')';gi=(gi+1)%25;}},320);
   lb.style.color='#d4a850';lb.textContent='Amtlich bestätigt';
-}}else if(vl>=2){{
+}}else if(vl>=3){{
   img.style.filter='drop-shadow(0 0 6px #d4a850) drop-shadow(0 0 12px #d4a850)';
   lb.style.color='#d4a850';lb.textContent='Verifiziert';
-}}else if(vl>=1){{
+}}else if(vl>=2){{
   img.style.filter='drop-shadow(0 0 6px #a33333) drop-shadow(0 0 12px #a33333)';
   lb.style.color='#a33333';lb.textContent='18+';
+}}else if(vl>=1){{
+  img.style.filter='drop-shadow(0 0 4px #ffffff80) drop-shadow(0 0 8px #ffffff40)';
+  lb.style.color='#4a8a4a';lb.textContent='Verbunden';
 }}else{{
-  img.style.filter='grayscale(100%)';lb.style.color='#665540';lb.textContent='ShinNexus';
+  img.style.filter='grayscale(100%)';lb.style.color='#665540';lb.textContent='nicht verbunden';
 }}
 </script></body></html>"""
         self.send_response(200)
@@ -10591,9 +12247,10 @@ if(vl>=3){{
                 if udata.get("shinpai_id") == sid:
                     target_for_flag = udata
                     break
-        # Auto-Upgrade: wenn User Amt-Lizenzen hat aber verification_level < 3 → korrigieren
-        # (Migration für Lizenzen die mit altem Code erstellt wurden)
-        if target_for_flag and int(target_for_flag.get("verification_level", 0)) < 3:
+        # Auto-Upgrade (5-Stufen-Schema): wenn User Amt-Lizenzen hat + Veriff-verifiziert
+        # ist aber verification_level < 4 → auf 4 hochstufen.
+        # Constraint (Hasi-Diktat 2026-05-03): Amt nur möglich nach Veriff (id_verified=True).
+        if target_for_flag and int(target_for_flag.get("verification_level", 0)) < 4:
             all_lics = _license_load_vault(LICENSES_RECEIVED_VAULT)
             has_amt = any(
                 l.get("subject", {}).get("shinpai_id") == sid
@@ -10601,16 +12258,19 @@ if(vl>=3){{
                 and int(l.get("valid_until", 0)) > int(time.time())
                 for l in all_lics
             )
-            if has_amt:
-                target_for_flag["verification_level"] = 3
+            id_verified = bool(target_for_flag.get("id_verified"))
+            if has_amt and id_verified:
+                target_for_flag["verification_level"] = 4
                 target_for_flag["verified_by"] = "amt"
                 target_for_flag["verified_at"] = int(time.time())
                 if target_for_flag is _identity:
                     _save_identity()
                 else:
                     _save_users()
-                status["verification_level"] = 3
-                nexus_log(f"🏅 Auto-Upgrade: Verification-Level auf 3 (bestehende Amt-Lizenzen)", "green")
+                status["verification_level"] = 4
+                nexus_log(f"🏅 Auto-Upgrade: Verification-Level auf 4 (Amt + Veriff)", "green")
+            elif has_amt and not id_verified:
+                nexus_log(f"⚠️ Amt-Lizenz vorhanden aber kein Veriff — Lvl 4 verweigert (Hasi-Constraint)", "yellow")
         pending = bool((target_for_flag or {}).get("card_pending_replacement", False))
         saved_lvl = int((target_for_flag or {}).get("saved_verification_level_before_card_replace", 0))
         status["card_pending_replacement"] = pending
@@ -11085,9 +12745,694 @@ if(vl>=3){{
             "licenses_removed": removed_cnt,
         })
 
+    def _handle_payment_status(self):
+        """GET /api/payment/status — Public Heartbeat ob Payment-Provider verfügbar.
+        Hasi-Diktat 2026-05-06: Sister-Apps zeigen den grünen Punkt nur wenn beide
+        Booleans True sind. configured=Key gesetzt, reachable=Stripe-API erreichbar.
+        """
+        cfg = load_config()
+        stripe_configured = HAS_STRIPE and bool(cfg.get("stripe_secret_key"))
+        stripe_reachable = False
+        if stripe_configured:
+            try:
+                _stripe_mod.api_key = cfg["stripe_secret_key"]
+                _stripe_mod.Customer.list(limit=1)
+                stripe_reachable = True
+            except Exception:
+                stripe_reachable = False
+        # PayPal kommt als nächstes — vorerst Stub
+        paypal_configured = bool(cfg.get("paypal_client_id") and cfg.get("paypal_client_secret"))
+        paypal_reachable = paypal_configured  # echter Reach-Check wenn PayPal-Lib eingebunden ist
+        self._send_json({
+            "stripe": {"configured": stripe_configured, "reachable": stripe_reachable},
+            "paypal": {"configured": paypal_configured, "reachable": paypal_reachable},
+        })
+
+    def _handle_payment_sister_checkout(self):
+        """POST /api/payment/sister-checkout — Sister-App startet Checkout (Stripe oder PayPal).
+
+        Auth: Bearer Owner-Connection-Token.
+        Body: {provider="stripe"|"paypal", item_name, amount_cents, currency=eur, success_url, cancel_url, metadata}
+        Returns: {ok, provider, url, session_id|order_id}
+        """
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            self._send_json({"error": "Rate limit"}, 429)
+            return
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            self._send_json({"error": "Bearer connection_token erforderlich"}, 401)
+            return
+        token = auth_header[len("Bearer "):].strip()
+        conn = find_connection_by_token(token)
+        if not conn or conn.get("verification_level") != "owner":
+            self._send_json({"error": "Owner-Connection erforderlich"}, 403)
+            return
+
+        cfg = load_config()
+
+        data = self._parse_json() or {}
+        provider = (data.get("provider") or "stripe").strip().lower()
+        if provider not in ("stripe", "paypal"):
+            self._send_json({"error": "provider muss 'stripe' oder 'paypal' sein"}, 400)
+            return
+
+        item_name = (data.get("item_name") or "").strip()[:128]
+        amount_cents = int(data.get("amount_cents") or 0)
+        currency = (data.get("currency") or "eur").strip().lower()
+        success_url = (data.get("success_url") or "").strip()
+        cancel_url = (data.get("cancel_url") or "").strip() or success_url
+        metadata = data.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        if not item_name or amount_cents <= 0 or not success_url:
+            self._send_json({"error": "item_name, amount_cents (>0), success_url Pflicht"}, 400)
+            return
+
+        # Sister-App-Identität ins Metadata damit der Webhook später routen kann
+        metadata["sister_app"] = conn.get("source_app", "")
+        metadata["sister_owner"] = conn.get("user_shinpai_id", "")
+        metadata["sister_connection_id"] = conn.get("connection_id", "")
+
+        if provider == "stripe":
+            if not HAS_STRIPE or not cfg.get("stripe_secret_key"):
+                self._send_json({"error": "Stripe im Nexus nicht konfiguriert"}, 503)
+                return
+            try:
+                _stripe_mod.api_key = cfg["stripe_secret_key"]
+                session = _stripe_mod.checkout.Session.create(
+                    payment_method_types=["card"],
+                    line_items=[{
+                        "price_data": {
+                            "currency": currency,
+                            "product_data": {"name": item_name},
+                            "unit_amount": amount_cents,
+                        },
+                        "quantity": 1,
+                    }],
+                    mode="payment",
+                    success_url=success_url,
+                    cancel_url=cancel_url,
+                    metadata=metadata,
+                )
+                nexus_log(f"💳 Sister-Checkout STRIPE {conn.get('source_app')}: {item_name} ({amount_cents/100:.2f} {currency})", "cyan")
+                self._send_json({"ok": True, "provider": "stripe", "url": session.url, "session_id": session.id})
+            except Exception as e:
+                nexus_log(f"❌ Sister-Checkout (Stripe) fehlgeschlagen: {e}", "red")
+                self._send_json({"error": f"Stripe-Checkout-Session fehlgeschlagen: {e}"}, 500)
+            return
+
+        # provider == "paypal"
+        if not (cfg.get("paypal_client_id") and cfg.get("paypal_client_secret")):
+            self._send_json({"error": "PayPal im Nexus nicht konfiguriert"}, 503)
+            return
+        # Reference-ID: Connection-ID + Timestamp damit PayPal-Side eindeutig korrelierbar ist
+        reference_id = f"{conn.get('connection_id','')[:32]}-{int(time.time())}"
+        try:
+            order = _paypal_create_order(
+                cfg=cfg,
+                item_name=item_name,
+                amount_cents=amount_cents,
+                currency=currency,
+                success_url=success_url,
+                cancel_url=cancel_url,
+                metadata=metadata,
+                reference_id=reference_id,
+            )
+            nexus_log(f"💳 Sister-Checkout PAYPAL {conn.get('source_app')}: {item_name} ({amount_cents/100:.2f} {currency})", "cyan")
+            self._send_json({
+                "ok": True,
+                "provider": "paypal",
+                "url": order["approve_url"],
+                "order_id": order["order_id"],
+            })
+        except Exception as e:
+            nexus_log(f"❌ Sister-Checkout (PayPal) fehlgeschlagen: {e}", "red")
+            self._send_json({"error": f"PayPal-Order fehlgeschlagen: {e}"}, 500)
+
+    def _handle_payment_sister_confirm(self):
+        """POST /api/payment/sister-confirm — Pull-Path: Sister-App fragt Status ab.
+
+        Architektur (Hasi-Diktat 2026-05-06):
+        Webhook funktioniert nur in DOMAIN_SECURE-Welten (Public-URL erreichbar).
+        Pull-Path ist Default für LAN_HTTP / Localhost / Public-IP-Welten —
+        Sister-App ruft das nach success_url-Redirect ab und schreibt Credits gut.
+        Beide Pfade nebeneinander aktiv, Idempotenz (related_id im credit_ledger)
+        verhindert Doppel-Verarbeitung.
+
+        Auth: Bearer connection_token (Owner-Connection).
+        Body: {provider: "stripe"|"paypal", session_id: "..."}
+        Returns: {ok, payment_status: "paid"|"unpaid"|..., amount_total, currency, metadata}
+        """
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            self._send_json({"error": "Rate limit"}, 429)
+            return
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            self._send_json({"error": "Bearer connection_token erforderlich"}, 401)
+            return
+        token = auth_header[len("Bearer "):].strip()
+        conn = find_connection_by_token(token)
+        if not conn or conn.get("verification_level") != "owner":
+            self._send_json({"error": "Owner-Connection erforderlich"}, 403)
+            return
+
+        cfg = load_config()
+        data = self._parse_json() or {}
+        provider = (data.get("provider") or "stripe").strip().lower()
+        session_id = (data.get("session_id") or "").strip()
+
+        if not session_id:
+            self._send_json({"error": "session_id Pflicht"}, 400)
+            return
+        if provider not in ("stripe", "paypal"):
+            self._send_json({"error": "provider muss 'stripe' oder 'paypal' sein"}, 400)
+            return
+
+        if provider == "stripe":
+            if not HAS_STRIPE or not cfg.get("stripe_secret_key"):
+                self._send_json({"error": "Stripe nicht konfiguriert"}, 503)
+                return
+            try:
+                _stripe_mod.api_key = cfg["stripe_secret_key"]
+                session = _stripe_mod.checkout.Session.retrieve(session_id)
+                # Stripe-StripeObject → echtes dict (dict() wirft KeyError(0) wegen iter-Protokoll)
+                _md = session.metadata
+                if _md is None:
+                    metadata = {}
+                elif hasattr(_md, "to_dict"):
+                    metadata = _md.to_dict()
+                else:
+                    metadata = {k: v for k, v in _md.items()}
+                # Sicherheits-Check: Connection muss zur Session passen
+                if metadata.get("sister_connection_id") and metadata["sister_connection_id"] != conn.get("connection_id"):
+                    self._send_json({"error": "Session gehört nicht zu dieser Connection"}, 403)
+                    return
+                self._send_json({
+                    "ok": True,
+                    "provider": "stripe",
+                    "session_id": session.id,
+                    "payment_status": session.payment_status,
+                    "amount_total": session.amount_total,
+                    "currency": session.currency,
+                    "metadata": metadata,
+                })
+                nexus_log(f"🔍 Sister-Confirm STRIPE {conn.get('source_app')}: {session_id[:16]}… status={session.payment_status}", "cyan")
+            except Exception as e:
+                # Detailliertes Error-Logging — Stripe-Lib gibt manchmal Exceptions ohne nutzbare str()
+                import traceback as _tb
+                err_type = type(e).__name__
+                err_repr = repr(e)
+                err_str = str(e) or "(leer)"
+                # Stripe-spezifische Felder falls verfügbar
+                stripe_details = {}
+                for attr in ("code", "user_message", "param", "http_status"):
+                    val = getattr(e, attr, None)
+                    if val is not None:
+                        stripe_details[attr] = val
+                json_body = getattr(e, "json_body", None)
+                if isinstance(json_body, dict):
+                    stripe_details["json_body"] = json_body
+                nexus_log(f"❌ Sister-Confirm (Stripe) fehlgeschlagen: type={err_type} repr={err_repr} str={err_str} stripe={stripe_details}", "red")
+                nexus_log(_tb.format_exc(), "red")
+                self._send_json({
+                    "error": f"Stripe Session-Retrieve fehlgeschlagen",
+                    "exception_type": err_type,
+                    "exception_str": err_str,
+                    "exception_repr": err_repr,
+                    "stripe": stripe_details,
+                }, 500)
+            return
+
+        # provider == "paypal"
+        if not (cfg.get("paypal_client_id") and cfg.get("paypal_client_secret")):
+            self._send_json({"error": "PayPal nicht konfiguriert"}, 503)
+            return
+        try:
+            order = _paypal_request(cfg, "GET", f"/v2/checkout/orders/{session_id}")
+            status = (order.get("status") or "").upper()
+            # PayPal: APPROVED → muss erst captured werden um COMPLETED zu sein
+            # Für unseren Flow akzeptieren wir COMPLETED als "paid"
+            payment_status = "paid" if status == "COMPLETED" else (
+                "approved" if status == "APPROVED" else status.lower()
+            )
+            purchase_units = order.get("purchase_units", []) or []
+            amount_total = 0
+            currency = "eur"
+            custom_id = ""
+            if purchase_units:
+                amt = purchase_units[0].get("amount", {}) or {}
+                try:
+                    amount_total = int(round(float(amt.get("value", "0")) * 100))
+                except (ValueError, TypeError):
+                    amount_total = 0
+                currency = (amt.get("currency_code", "EUR") or "EUR").lower()
+                custom_id = purchase_units[0].get("custom_id", "")
+            self._send_json({
+                "ok": True,
+                "provider": "paypal",
+                "session_id": session_id,
+                "order_status": status,
+                "payment_status": payment_status,
+                "amount_total": amount_total,
+                "currency": currency,
+                "metadata": {"custom_id": custom_id},
+            })
+            nexus_log(f"🔍 Sister-Confirm PAYPAL {conn.get('source_app')}: {session_id[:16]}… status={status}", "cyan")
+        except Exception as e:
+            nexus_log(f"❌ Sister-Confirm (PayPal) fehlgeschlagen: {e}", "red")
+            self._send_json({"error": f"PayPal Order-Retrieve fehlgeschlagen: {e}"}, 500)
+
+    def _handle_payment_stripe_webhook(self):
+        """POST /api/payment/stripe-webhook — Stripe-Event empfangen + an Sister-App weiterleiten.
+
+        Stripe sendet das Event-JSON mit Stripe-Signature-Header, wir validieren es mit
+        dem webhook_secret aus der Config. Bei checkout.session.completed wird das Event
+        an die Sister-App's /api/payment/webhook weitergeleitet (Bearer = secret_token).
+        """
+        cfg = load_config()
+        webhook_secret = cfg.get("stripe_webhook_secret", "")
+        if not webhook_secret or not HAS_STRIPE:
+            self._send_json({"error": "Webhook nicht konfiguriert (stripe_webhook_secret)"}, 503)
+            return
+
+        sig_header = self.headers.get("Stripe-Signature", "")
+        payload_len = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            payload = self.rfile.read(payload_len)
+        except Exception:
+            self._send_json({"error": "Payload-Read fehlgeschlagen"}, 400)
+            return
+
+        try:
+            _stripe_mod.api_key = cfg["stripe_secret_key"]
+            event = _stripe_mod.Webhook.construct_event(payload, sig_header, webhook_secret)
+        except Exception as e:
+            nexus_log(f"❌ Stripe-Webhook Signatur ungültig: {e}", "red")
+            self._send_json({"error": "Signature ungültig"}, 400)
+            return
+
+        if event.get("type") != "checkout.session.completed":
+            self._send_json({"received": True, "ignored": True})
+            return
+
+        sess = event.get("data", {}).get("object", {}) or {}
+        metadata = sess.get("metadata") or {}
+        sister_app = metadata.get("sister_app", "")
+        sister_owner = metadata.get("sister_owner", "")
+        if not sister_app:
+            self._send_json({"received": True, "info": "Kein Sister-App-Tag im Metadata"})
+            return
+
+        # Sister-App-Connection finden um source_url + secret_token zu holen
+        target = None
+        for c in _connections.values():
+            if (c.get("user_shinpai_id") == sister_owner
+                    and c.get("source_app") == sister_app
+                    and not c.get("revoked_at")
+                    and c.get("verification_level") == "owner"):
+                target = c
+                break
+        if not target:
+            nexus_log(f"❌ Sister-Webhook-Forward: keine Owner-Connection für {sister_app}", "red")
+            self._send_json({"received": True, "info": "Kein passender Sister-Endpoint"})
+            return
+
+        sister_url = (target.get("source_url") or "").rstrip("/")
+        sister_token = target.get("secret_token") or ""
+        if not sister_url or not sister_token:
+            self._send_json({"received": True, "info": "Sister source_url oder secret_token fehlt"})
+            return
+
+        forward = {
+            "type": "payment.completed",
+            "session_id": sess.get("id"),
+            "amount_total": sess.get("amount_total"),
+            "currency": sess.get("currency"),
+            "payment_status": sess.get("payment_status"),
+            "metadata": metadata,
+        }
+        try:
+            import urllib.request as _ur
+            req = _ur.Request(
+                f"{sister_url}/api/payment/webhook",
+                data=json.dumps(forward).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {sister_token}",
+                },
+            )
+            with _ur.urlopen(req, timeout=10) as _resp:
+                pass
+            nexus_log(f"💳 Webhook geforwarded an {sister_app}: {sess.get('id','')[:16]}…", "green")
+        except Exception as e:
+            nexus_log(f"❌ Webhook-Forward fehlgeschlagen: {e}", "red")
+            # Trotzdem 200 an Stripe damit nicht endlos retried wird
+        self._send_json({"received": True})
+
+    def _handle_deeplink_open(self):
+        """GET /deeplink/open?code=... — Code einlösen, Session aufmachen, zur Section springen.
+
+        Single-Use, 5 Min TTL. Bei Erfolg: 302 Redirect auf "/" mit Auto-Open-Hint
+        und Set-Cookie nexus_session. Bei Fehler: HTML-Fehler-Page.
+        """
+        query = parse_qs(urlparse(self.path).query)
+        code = (query.get("code", [""])[0] or "").strip()
+        if not code:
+            self._deeplink_error("Kein Code übergeben")
+            return
+
+        rec = _deeplink_code_consume(code)
+        if not rec:
+            self._deeplink_error("Code ungültig, abgelaufen oder schon verwendet")
+            return
+
+        shinpai_id = rec["shinpai_id"]
+        action = rec["action"]
+        is_owner = rec["is_owner"]
+
+        # Session aufbauen — nur Owner-Connection ermöglicht echten Auto-Login
+        # (Non-Owner-User bräuchten ihre PQ-Keys entschlüsselt, was ohne PW nicht geht)
+        if not is_owner:
+            self._deeplink_error("Deeplink für Non-Owner-Accounts noch nicht unterstützt")
+            return
+
+        # Owner-Auth-Session erzeugen (nutzt _pq_keys = Owner-Keys)
+        if not _identity or _identity.get("shinpai_id") != shinpai_id:
+            self._deeplink_error("Account-Mismatch — dieser Nexus gehört einem anderen Owner")
+            return
+
+        session = _create_auth_session(source="deeplink")
+        if not session or not session.get("token"):
+            self._deeplink_error("Session-Erstellung fehlgeschlagen (Vault zu?)")
+            return
+
+        # Auto-Open-Hint aus der Whitelist herauslesen
+        action_def = DEEPLINK_ACTIONS.get(action, {})
+        open_tab = action_def.get("tab", "")
+        open_section = action_def.get("section", "")
+        open_edit = action_def.get("edit", "")
+        # Section impliziert Tab nicht — manche Sections leben nicht in Tabs (Modals etc).
+        # edit zeigt auf eine srv-<name>-edit-Box im Server-Tab (Stripe/SMTP/...).
+        # Frontend-Auto-Open-JS muss alle drei prüfen.
+
+        params = []
+        if open_tab:
+            params.append(f"open_tab={open_tab}")
+        if open_section:
+            params.append(f"open_section={open_section}")
+        if open_edit:
+            params.append(f"open_edit={open_edit}")
+        redirect_target = "/" + ("?" + "&".join(params) if params else "")
+
+        nexus_log(f"🔓 Deeplink eingelöst: {shinpai_id} → {action}", "green")
+
+        # 302 Redirect mit Set-Cookie — SameSite=Lax weil die Navigation aus
+        # einer Sister-App-Origin kommt (Top-Level-Open via window.open).
+        # Strict würde den Cookie beim Folge-Request an "/" unterdrücken
+        # → Login-Seite trotz erfolgreichem Code-Einlösen.
+        self.send_response(302)
+        cookie_name, cookie_val = self._session_cookie_header(session["token"], cross_site=True)
+        self.send_header(cookie_name, cookie_val)
+        self.send_header("Location", redirect_target)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _deeplink_error(self, msg: str):
+        """HTML-Fehler-Page bei Deeplink-Fehlschlag."""
+        nexus_log(f"❌ Deeplink fehlgeschlagen: {msg}", "yellow")
+        html = f"""<!DOCTYPE html><html lang="de"><head>
+<meta charset="utf-8"><title>Deeplink fehlgeschlagen</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:520px;margin:80px auto;padding:24px;background:#0a0a14;color:#e0e0e0;border:1px solid #2a2a3a;border-radius:12px;}}
+h1{{color:#e44;margin-top:0;}}p{{line-height:1.6;}}a{{color:#7ab8e0;}}</style>
+</head><body>
+<h1>🔒 Deeplink ungültig</h1>
+<p>{msg}</p>
+<p>Mögliche Ursachen:</p>
+<ul>
+<li>Code ist älter als 5 Minuten</li>
+<li>Code wurde bereits verwendet (single-use)</li>
+<li>Link beschädigt oder unvollständig kopiert</li>
+</ul>
+<p>Bitte zurück zur Sister-App und Button erneut klicken.</p>
+<p><a href="/">⌂ Zur Login-Seite</a></p>
+</body></html>"""
+        body = html.encode("utf-8")
+        self.send_response(403)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_deeplink_issue(self):
+        """POST /api/deeplink/issue — Sister-App fordert Deeplink-Code für Action.
+
+        Auth: Bearer connection_token (Pair-Exchange-Token, gehört zu (user × app)).
+        Body: {action: "stripe-config" | ... }
+        Returns: {ok, url, expires_in}
+
+        Sicherheit:
+        - Action muss in DEEPLINK_ACTIONS-Whitelist stehen (kein Free-Form)
+        - owner_only-Actions nur wenn Connection vom Owner-Account kommt
+        - Code ist single-use, 5 Min TTL, gebunden an shinpai_id
+        """
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            self._send_json({"error": "Rate limit"}, 429)
+            return
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            self._send_json({"error": "Bearer connection_token erforderlich"}, 401)
+            return
+        token = auth_header[len("Bearer "):].strip()
+        conn = find_connection_by_token(token)
+        if not conn:
+            self._send_json({"error": "Connection-Token ungültig"}, 401)
+            return
+
+        data = self._parse_json() or {}
+        action = (data.get("action") or "").strip().lower()
+        if action not in DEEPLINK_ACTIONS:
+            self._send_json({"error": f"Unbekannte Action: {action}"}, 400)
+            return
+
+        action_def = DEEPLINK_ACTIONS[action]
+        is_owner_conn = (conn.get("verification_level") == "owner")
+
+        if action_def.get("owner_only") and not is_owner_conn:
+            self._send_json({"error": "Action nur für Owner-Connection erlaubt"}, 403)
+            return
+
+        shinpai_id = conn.get("user_shinpai_id", "")
+        if not shinpai_id:
+            self._send_json({"error": "Connection ohne Account-Bindung"}, 500)
+            return
+
+        code = _deeplink_code_create(
+            shinpai_id=shinpai_id,
+            action=action,
+            is_owner=is_owner_conn,
+        )
+
+        # Eigene Public-URL als Basis (Owner hat sie konfiguriert) — sonst aus Request rekonstruieren
+        cfg = load_config()
+        base_url = (cfg.get("public_url") or "").rstrip("/")
+        if not base_url:
+            # Fallback: Host-Header (funktioniert für LAN/Loopback)
+            host = self.headers.get("Host", "")
+            scheme = "https" if _tls_active else "http"
+            base_url = f"{scheme}://{host}" if host else ""
+
+        deeplink_url = f"{base_url}/deeplink/open?code={code}"
+        nexus_log(f"🔗 Deeplink: {action} für {shinpai_id} (TTL {DEEPLINK_TTL_SECONDS}s)", "cyan")
+        self._send_json({
+            "ok": True,
+            "url": deeplink_url,
+            "expires_in": DEEPLINK_TTL_SECONDS,
+            "action": action,
+            "label": action_def.get("label", action),
+        })
+
+    def _handle_payment_paypal_webhook(self):
+        """POST /api/payment/paypal-webhook — PayPal-Event empfangen + an Sister-App weiterleiten.
+
+        PayPal-Signaturen werden NICHT lokal mit HMAC verifiziert (anders als Stripe).
+        Wir reichen Headers + Body an PayPal' Verify-Endpoint und lassen die selber
+        bestätigen. Bei PAYMENT.CAPTURE.COMPLETED bzw CHECKOUT.ORDER.APPROVED wird
+        das Event an die Sister-App's /api/payment/webhook geforwarded.
+        """
+        cfg = load_config()
+        if not (cfg.get("paypal_client_id") and cfg.get("paypal_client_secret")):
+            self._send_json({"error": "PayPal nicht konfiguriert"}, 503)
+            return
+
+        payload_len = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            payload = self.rfile.read(payload_len)
+        except Exception:
+            self._send_json({"error": "Payload-Read fehlgeschlagen"}, 400)
+            return
+
+        # Signatur via PayPal-Verify-Endpoint prüfen (Cert-basiert, nicht HMAC)
+        if not _paypal_verify_webhook(cfg, self.headers, payload):
+            nexus_log("❌ PayPal-Webhook Signatur ungültig", "red")
+            self._send_json({"error": "Signature ungültig"}, 400)
+            return
+
+        try:
+            event = json.loads(payload.decode("utf-8"))
+        except Exception:
+            self._send_json({"error": "JSON-Parse fehlgeschlagen"}, 400)
+            return
+
+        event_type = event.get("event_type", "")
+        # Wir interessieren uns nur für abgeschlossene Captures (Geld ist final beim Verkäufer)
+        if event_type != "PAYMENT.CAPTURE.COMPLETED":
+            self._send_json({"received": True, "ignored": True, "type": event_type})
+            return
+
+        resource = event.get("resource", {}) or {}
+        # custom_id transportiert unser Metadata-JSON. PayPal hängt's je nach Event-Pfad
+        # entweder direkt an die Capture (resource.custom_id) oder ins Parent purchase_unit.
+        custom_id_raw = resource.get("custom_id", "")
+        if not custom_id_raw:
+            # Fallback: über supplementary_data → related_ids → order_id auflösen
+            order_id = resource.get("supplementary_data", {}).get("related_ids", {}).get("order_id", "")
+            if order_id:
+                try:
+                    order = _paypal_get_order(cfg, order_id)
+                    pus = order.get("purchase_units", []) or []
+                    if pus:
+                        custom_id_raw = pus[0].get("custom_id", "")
+                except Exception as e:
+                    nexus_log(f"❌ PayPal-Order-Lookup fehlgeschlagen: {e}", "red")
+
+        try:
+            metadata = json.loads(custom_id_raw) if custom_id_raw else {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+        except Exception:
+            metadata = {}
+
+        sister_app = metadata.get("sister_app", "")
+        sister_owner = metadata.get("sister_owner", "")
+        if not sister_app:
+            self._send_json({"received": True, "info": "Kein Sister-App-Tag im custom_id"})
+            return
+
+        # Sister-App-Connection finden um source_url + secret_token zu holen
+        target = None
+        for c in _connections.values():
+            if (c.get("user_shinpai_id") == sister_owner
+                    and c.get("source_app") == sister_app
+                    and not c.get("revoked_at")
+                    and c.get("verification_level") == "owner"):
+                target = c
+                break
+        if not target:
+            nexus_log(f"❌ PayPal-Webhook-Forward: keine Owner-Connection für {sister_app}", "red")
+            self._send_json({"received": True, "info": "Kein passender Sister-Endpoint"})
+            return
+
+        sister_url = (target.get("source_url") or "").rstrip("/")
+        sister_token = target.get("secret_token") or ""
+        if not sister_url or not sister_token:
+            self._send_json({"received": True, "info": "Sister source_url oder secret_token fehlt"})
+            return
+
+        # PayPal-Capture-Felder normalisieren auf das Format das die Sister erwartet
+        # (analog zum Stripe-Forward — gleiche Schlüssel, andere Quelle)
+        capture_amount = resource.get("amount", {}) or {}
+        # amount_total in Cents (analog Stripe.amount_total)
+        try:
+            amount_total = int(round(float(capture_amount.get("value", "0")) * 100))
+        except Exception:
+            amount_total = 0
+        currency = (capture_amount.get("currency_code") or "").lower()
+
+        forward = {
+            "type": "payment.completed",
+            "provider": "paypal",
+            "session_id": resource.get("id", ""),  # Capture-ID
+            "order_id": metadata.get("order_id") or resource.get("supplementary_data", {}).get("related_ids", {}).get("order_id", ""),
+            "amount_total": amount_total,
+            "currency": currency,
+            "payment_status": (resource.get("status") or "").lower(),
+            "metadata": metadata,
+        }
+        try:
+            import urllib.request as _ur
+            req = _ur.Request(
+                f"{sister_url}/api/payment/webhook",
+                data=json.dumps(forward).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {sister_token}",
+                },
+            )
+            with _ur.urlopen(req, timeout=10) as _resp:
+                pass
+            nexus_log(f"💳 PayPal-Webhook geforwarded an {sister_app}: {resource.get('id','')[:16]}…", "green")
+        except Exception as e:
+            nexus_log(f"❌ PayPal-Webhook-Forward fehlgeschlagen: {e}", "red")
+            # Trotzdem 200 an PayPal damit nicht endlos retried wird
+        self._send_json({"received": True})
+
+    def _handle_paypal_config(self):
+        """POST /api/paypal/config — PayPal Credentials konfigurieren (Owner only).
+        Body: {paypal_client_id, paypal_client_secret, paypal_webhook_id, paypal_mode: "sandbox"|"live"}
+        """
+        session = self._require_auth()
+        if not session:
+            return
+        if not _identity or session.get("shinpai_id") != _identity.get("shinpai_id"):
+            self._send_json({"error": "Nur Owner darf PayPal konfigurieren"}, 403)
+            return
+
+        data = self._parse_json() or {}
+        client_id = (data.get("paypal_client_id") or "").strip()
+        client_secret = (data.get("paypal_client_secret") or "").strip()
+        webhook_id = (data.get("paypal_webhook_id") or "").strip()
+        mode = (data.get("paypal_mode") or "sandbox").strip().lower()
+
+        if not client_id or not client_secret:
+            self._send_json({"error": "paypal_client_id und paypal_client_secret erforderlich"}, 400)
+            return
+        if mode not in ("sandbox", "live"):
+            self._send_json({"error": "paypal_mode muss 'sandbox' oder 'live' sein"}, 400)
+            return
+
+        cfg = load_config()
+        cfg["paypal_client_id"] = client_id
+        cfg["paypal_client_secret"] = client_secret
+        if webhook_id:
+            cfg["paypal_webhook_id"] = webhook_id
+        cfg["paypal_mode"] = mode
+        save_config(cfg)
+
+        # Token-Cache invalidieren falls Mode/Credentials gewechselt
+        global _paypal_token_cache
+        _paypal_token_cache = {"token": "", "expires_at": 0.0}
+
+        nexus_log(f"✅ PayPal konfiguriert (mode={mode})", "green")
+        self._send_json({
+            "ok": True,
+            "paypal_configured": True,
+            "mode": mode,
+            "webhook_id_set": bool(webhook_id),
+        })
+
     def _handle_stripe_config(self):
         """POST /api/stripe/config — Stripe API-Key konfigurieren (Owner only, TLS-geschützt).
-        Body: {stripe_secret_key: "sk_...", stripe_publishable_key: "pk_..."}"""
+        Body: {stripe_secret_key: "sk_...", stripe_publishable_key: "pk_...", stripe_webhook_secret: "whsec_..."}
+
+        stripe_webhook_secret wird vom Webhook-Handler (_handle_payment_stripe_webhook)
+        zur Signatur-Verifikation benötigt — ohne den Secret kann Nexus keine Stripe-Events
+        empfangen. Optional, aber Pflicht sobald die Webhook-URL bei Stripe registriert ist.
+        """
         session = self._require_auth()
         if not session:
             return
@@ -11099,6 +13444,7 @@ if(vl>=3){{
         data = self._parse_json()
         sk = data.get("stripe_secret_key", "")
         pk = data.get("stripe_publishable_key", "")
+        whsec = data.get("stripe_webhook_secret", "")
 
         if not sk:
             self._send_json({"error": "stripe_secret_key erforderlich"}, 400)
@@ -11108,9 +13454,15 @@ if(vl>=3){{
         cfg["stripe_secret_key"] = sk
         if pk:
             cfg["stripe_publishable_key"] = pk
+        if whsec:
+            cfg["stripe_webhook_secret"] = whsec
         save_config(cfg)
         nexus_log("✅ Stripe API-Keys konfiguriert", "green")
-        self._send_json({"ok": True, "stripe_configured": True})
+        self._send_json({
+            "ok": True,
+            "stripe_configured": True,
+            "webhook_secret_set": bool(cfg.get("stripe_webhook_secret", "")),
+        })
 
     def _handle_server_status(self):
         """GET /api/server/status — Server-Konfig Status (Owner only, maskiert)."""
@@ -11127,7 +13479,7 @@ if(vl>=3){{
             if len(val) <= keep:
                 return val + "..."
             return val[:keep] + "..."
-        # SMTP (verschachtelt: cfg["smtp"] = {host, port, user, password, from})
+        # SMTP (verschachtelt: cfg["smtp"] = {host, port, user, from} — PW liegt im Vault unter smtp.vault)
         _smtp_cfg = cfg.get("smtp", {})
         smtp = {
             "configured": smtp_configured(),
@@ -11142,6 +13494,17 @@ if(vl>=3){{
             "configured": bool(cfg.get("stripe_secret_key", "")),
             "publishable_key": cfg.get("stripe_publishable_key", ""),
             "secret_key_masked": _mask(cfg.get("stripe_secret_key", ""), 12),
+            "webhook_secret_set": bool(cfg.get("stripe_webhook_secret", "")),
+            "webhook_secret_masked": _mask(cfg.get("stripe_webhook_secret", ""), 8),
+        }
+        # PayPal
+        paypal_cfg = {
+            "configured": bool(cfg.get("paypal_client_id", "") and cfg.get("paypal_client_secret", "")),
+            "client_id_masked": _mask(cfg.get("paypal_client_id", ""), 12),
+            "client_secret_set": bool(cfg.get("paypal_client_secret", "")),
+            "webhook_id_set": bool(cfg.get("paypal_webhook_id", "")),
+            "webhook_id_masked": _mask(cfg.get("paypal_webhook_id", ""), 8),
+            "mode": cfg.get("paypal_mode", "sandbox"),
         }
         # Veriff
         veriff_cfg = {
@@ -11155,7 +13518,7 @@ if(vl>=3){{
         public_cfg = {
             "url": cfg.get("public_url", ""),
         }
-        self._send_json({"smtp": smtp, "stripe": stripe_cfg, "veriff": veriff_cfg, "public": public_cfg})
+        self._send_json({"smtp": smtp, "stripe": stripe_cfg, "paypal": paypal_cfg, "veriff": veriff_cfg, "public": public_cfg})
 
     # ── Federation: Amt-Listen-Abos (Phase 1 Step 2) ─────────────────
     def _handle_amt_lists_get(self):
@@ -11415,6 +13778,12 @@ if(vl>=3){{
                 "is_valid": is_valid,
             })
         light.sort(key=lambda x: x.get("issued_at", 0), reverse=True)
+        # Filter via Query-Param scope=shinshare-owner (Hasi-Diktat 2026-05-03)
+        from urllib.parse import urlparse, parse_qs as _pqs
+        qs = _pqs(urlparse(self.path).query)
+        scope_filter = (qs.get("scope") or [""])[0].strip()
+        if scope_filter == "shinshare-owner":
+            light = [l for l in light if (l.get("scope") or {}).get("shinshare", {}).get("role") == "owner"]
         self._send_json({"count": len(light), "licenses": light})
 
     # ── Amt-Watchlist (vorgemerkte Ämter für Stufe-3-Verifikation) ───
@@ -11668,7 +14037,8 @@ if(vl>=3){{
         if not lic:
             self._send_json({"error": "Lizenz-Erzeugung fehlgeschlagen"}, 500)
             return
-        # Verification-Level auf 3 hochstufen wenn noch nicht da (Amt-bestätigt → Shield leuchtet)
+        # Verification-Level auf 4 hochstufen wenn noch nicht da (Amt-bestätigt → Shield leuchtet)
+        # Constraint (Hasi-Diktat 2026-05-03): Amt nur mit Veriff (id_verified=True).
         target_v = None
         if _identity and _identity.get("shinpai_id") == sid_user:
             target_v = _identity
@@ -11677,15 +14047,18 @@ if(vl>=3){{
                 if udata.get("shinpai_id") == sid_user:
                     target_v = udata
                     break
-        if target_v and int(target_v.get("verification_level", 0)) < 3:
-            target_v["verification_level"] = 3
-            target_v["verified_by"] = "amt"
-            target_v["verified_at"] = int(time.time())
-            if target_v is _identity:
-                _save_identity()
+        if target_v and int(target_v.get("verification_level", 0)) < 4:
+            if not target_v.get("id_verified"):
+                nexus_log(f"⚠️ Amt-Lizenz vergeben aber kein Veriff — Lvl-Sprung auf 4 verweigert", "yellow")
             else:
-                _save_users()
-            nexus_log(f"🏅 Verification-Level auf 3 (Amt-bestätigt)", "green")
+                target_v["verification_level"] = 4
+                target_v["verified_by"] = "amt"
+                target_v["verified_at"] = int(time.time())
+                if target_v is _identity:
+                    _save_identity()
+                else:
+                    _save_users()
+                nexus_log(f"🏅 Verification-Level auf 4 (Amt + Veriff)", "green")
         # Watchlist-Status auf confirmed + Timestamp
         now = int(time.time())
         for item in items:
@@ -12711,8 +15084,10 @@ if(vl>=3){{
         force_logout = 'logout' in _qs
 
         # ── Content bestimmen ──
-        if not force_logout and (is_local or session) and has_account:
-            # Eingeloggt (lokal ODER authentifiziert) → Dashboard
+        # Hasi-Diktat 2026-05-03: KEIN is_local-Auto-Auth mehr — auch der lokale
+        # Owner muss sich einloggen. Inkognito-Sicherheit wieder konsistent.
+        if not force_logout and session and has_account:
+            # Eingeloggt via Session → Dashboard
             # Wer ist eingeloggt? Owner (lokal) oder Session-User?
             if session and session.get("shinpai_id") != (_identity or {}).get("shinpai_id"):
                 # Non-Owner-User via Session
@@ -12900,6 +15275,26 @@ if(vl>=3){{
                     <input type="text" id="stripe-pk" placeholder="Publishable Key (pk_...)" style="margin-bottom:4px;font-size:11px;padding:7px;">
                     <button onclick="doStripeSave()" class="btn" style="font-size:11px;width:100%;background:rgba(170,120,255,0.15);border:1px solid rgba(170,120,255,0.4);color:#aa78ff;">💾 Speichern</button>
                     <div id="stripe-msg" style="font-size:11px;margin-top:6px;text-align:center;"></div>
+                  </div>
+                </div>
+                <!-- PayPal (PayPal-Blau) -->
+                <div style="background:linear-gradient(135deg,rgba(0,112,186,0.08),rgba(10,15,25,0.6));padding:14px;border-radius:8px;margin-bottom:10px;border:1px solid rgba(0,112,186,0.25);">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <div style="font-size:12px;color:#4a90d9;font-weight:bold;">💰 PayPal</div>
+                    <div id="srv-paypal-status" style="font-size:10px;color:#665540;">Lade...</div>
+                  </div>
+                  <div id="srv-paypal-info" style="font-size:10px;color:#887755;line-height:1.6;margin-bottom:8px;"></div>
+                  <button onclick="toggleServerEdit('paypal')" class="btn" style="font-size:11px;width:100%;background:rgba(0,112,186,0.15);border:1px solid rgba(0,112,186,0.4);color:#4a90d9;">Bearbeiten</button>
+                  <div id="srv-paypal-edit" style="display:none;margin-top:10px;">
+                    <input type="text" id="paypal-client-id" placeholder="Client ID" style="margin-bottom:4px;font-size:11px;padding:7px;">
+                    <input type="password" id="paypal-client-secret" placeholder="Client Secret" style="margin-bottom:4px;font-size:11px;padding:7px;">
+                    <input type="text" id="paypal-webhook-id" placeholder="Webhook ID (optional, für Webhook-Events)" style="margin-bottom:4px;font-size:11px;padding:7px;">
+                    <select id="paypal-mode" style="width:100%;margin-bottom:4px;font-size:11px;padding:7px;background:#0a0f18;color:#aac0d8;border:1px solid rgba(0,112,186,0.25);border-radius:4px;">
+                      <option value="sandbox">Sandbox (Test-Modus)</option>
+                      <option value="live">Live (Produktion)</option>
+                    </select>
+                    <button onclick="doPaypalSave()" class="btn" style="font-size:11px;width:100%;background:rgba(0,112,186,0.15);border:1px solid rgba(0,112,186,0.4);color:#4a90d9;">💾 Speichern</button>
+                    <div id="paypal-msg" style="font-size:11px;margin-top:6px;text-align:center;"></div>
                   </div>
                 </div>
                 <!-- Veriff (Helltürkis) -->
@@ -13092,6 +15487,7 @@ if(vl>=3){{
                 <button onclick="showDashTab('verifikation')" class="dash-tab" data-tab="verifikation" id="dtab-verifikation" style="font-size:11px;padding:8px 14px;background:none;border:1px solid transparent;border-bottom:1px solid #2a2a3a;border-radius:6px 6px 0 0;margin-bottom:-1px;color:#665540;cursor:pointer;position:relative;z-index:1;">🛡️ Verifikation</button>
                 <button onclick="showDashTab('lizenzen')" class="dash-tab" data-tab="lizenzen" id="dtab-lizenzen" style="font-size:11px;padding:8px 14px;background:none;border:1px solid transparent;border-bottom:1px solid #2a2a3a;border-radius:6px 6px 0 0;margin-bottom:-1px;color:#665540;cursor:pointer;position:relative;z-index:1;">🦋 Lizenzen</button>
                 <button onclick="showDashTab('amt')" class="dash-tab" data-tab="amt" id="dtab-amt" style="font-size:11px;padding:8px 14px;background:none;border:1px solid transparent;border-bottom:1px solid #2a2a3a;border-radius:6px 6px 0 0;margin-bottom:-1px;color:#665540;cursor:pointer;position:relative;z-index:1;">🏛️ Ämter</button>
+                <button onclick="showDashTab('verbunden');loadConnections();" class="dash-tab" data-tab="verbunden" id="dtab-verbunden" style="font-size:11px;padding:8px 14px;background:none;border:1px solid transparent;border-bottom:1px solid #2a2a3a;border-radius:6px 6px 0 0;margin-bottom:-1px;color:#665540;cursor:pointer;position:relative;z-index:1;">🔗 Verbunden</button>
                 {whitelist_tab_btn}
                 {server_tab_btn}
               </div>
@@ -13372,7 +15768,48 @@ if(vl>=3){{
                   <div style="font-size:11px;color:#a06ad0;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">🪶 Als Prüfstelle ausgestellt</div>
                   <div id="issued-licenses" style="font-size:11px;color:#665540;">Du hast noch keine anderen Nexus verifiziert. Bedingung: Selbst verifiziert sein.</div>
                 </div>
-                <p style="font-size:9px;color:#445566;text-align:center;margin-top:12px;">Challenge-Response Verifikation kommt mit dem Wasserzeichen-Update.</p>
+
+                <p style="font-size:9px;color:#445566;text-align:center;margin-top:12px;">ShinShare und andere Programme verbinden sich über den Verbundene-Programme-Tab via Pair-Code.</p>
+              </div>
+
+              <!-- Verbundene Programme (Pair-API, Hasi-Diktat 2026-05-03) -->
+              <div id="dash-verbunden" class="dash-tab-content" style="display:none;background:rgba(20,20,30,0.6);border:1px solid #2a2a3a;border-top:1px solid #2a2a3a;border-radius:0 8px 8px 8px;padding:18px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:8px;flex-wrap:wrap;">
+                  <h3 style="margin:0;color:#a070e0;font-size:14px;">🔗 Verbundene Programme</h3>
+                  <div style="display:flex;gap:8px;">
+                    <button onclick="rollVorschuss()" id="btn-vorschuss" style="font-size:11px;padding:6px 12px;background:rgba(232,196,100,0.15);color:#e8c464;border:1px solid rgba(232,196,100,0.4);border-radius:6px;cursor:pointer;" title="Würfelt für ALLE Programme einen neuen Token. 1× pro 24h. Inaktive Programme bleiben sichtbar bis du sie revokest.">🎲 Vertrauensvorschuss</button>
+                    <button onclick="startPair()" style="font-size:11px;padding:6px 14px;background:linear-gradient(135deg,#7e5bef,#e0a070);color:white;border:none;border-radius:6px;cursor:pointer;">➕ Neues Programm</button>
+                  </div>
+                </div>
+                <p style="font-size:11px;color:#665540;margin-bottom:8px;">
+                  Apps wie ShinShare oder Shidow verbinden sich hier. Master-PW bleibt im Nexus,
+                  Programme bekommen nur einen revoke-baren Token. Funktioniert auch auf localhost.
+                </p>
+                <p style="font-size:10px;color:#665540;margin-bottom:14px;font-style:italic;">
+                  💡 <strong>Vertrauensvorschuss</strong> rotiert für alle aktiven Programme den Token —
+                  beim nächsten Refresh-Call der App wird getauscht. Inaktive Apps bekommen keinen neuen
+                  Token, du siehst sie als 🟡 markiert und kannst manuell revoken.
+                </p>
+                <div id="vorschuss-status" style="font-size:11px;color:#665540;margin-bottom:12px;"></div>
+                <div id="connections-list" style="font-size:12px;">
+                  <p style="color:#665540;">Lade Verbindungen…</p>
+                </div>
+
+                <!-- Pair-Code-Modal -->
+                <div id="pair-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:9999;align-items:center;justify-content:center;">
+                  <div style="background:#10101a;border:1px solid #3a2a5a;border-radius:12px;padding:30px 36px;max-width:420px;text-align:center;box-shadow:0 0 60px rgba(122,184,224,0.3);">
+                    <div style="font-size:36px;margin-bottom:6px;">🔗</div>
+                    <h3 style="color:#a070e0;font-size:16px;margin:0 0 10px;">Pairing-Code für die App</h3>
+                    <p style="color:#665540;font-size:11px;margin:0 0 16px;">In der App eintippen — Master-PW bleibt hier, geht nicht raus.</p>
+                    <div id="pair-code-display" style="font-family:'Courier New',monospace;font-size:32px;letter-spacing:6px;color:#7ab8e0;background:rgba(122,184,224,0.08);border:1px solid rgba(122,184,224,0.3);border-radius:8px;padding:18px;margin:14px 0;cursor:pointer;" onclick="navigator.clipboard.writeText(this.textContent.replace(/-/g,''));this.style.color='#7ce0a4';setTimeout(()=>this.style.color='#7ab8e0',1000);" title="Klick = kopieren">…</div>
+                    <p id="pair-code-ttl" style="color:#e8c464;font-size:11px;margin:6px 0 14px;">Gültig 5:00 min</p>
+                    <input type="text" id="pair-label-hint" placeholder="Label (optional, z.B. 'Heimwerker-PC')" style="width:100%;padding:8px;background:#1a1a2a;color:#e0d8c8;border:1px solid #2a2a3a;border-radius:6px;font-size:12px;margin-bottom:10px;">
+                    <div style="display:flex;gap:8px;justify-content:center;">
+                      <button onclick="startPair(true)" style="font-size:11px;padding:8px 16px;background:#1a1a2a;color:#e0d8c8;border:1px solid #2a2a3a;border-radius:6px;cursor:pointer;">🔄 Neuer Code</button>
+                      <button onclick="closePairModal()" style="font-size:11px;padding:8px 16px;background:#2a1a3a;color:#e0d8c8;border:1px solid #3a2a4a;border-radius:6px;cursor:pointer;">Schließen</button>
+                    </div>
+                  </div>
+                </div>
               </div>
 
               <!-- Ämter-Tab (Lizenzmodell Phase 1, Drill-Down Navigation: Kategorie → Subklasse → Ämter) -->
@@ -14078,7 +16515,16 @@ async function doLogin() {{
       setTimeout(() => el('totp').focus(), 100);
     }} else if (d.authenticated) {{
       // XSS-Hardening 2026-04-30: Cookie wird vom Server per HttpOnly Set-Cookie gesetzt.
-      location.href = '/';
+      // Pair-Resume: wenn pending pair_request → direkt dahin statt zur Startseite
+      const _pending = sessionStorage.getItem('_pending_pair_request');
+      if (_pending) {{
+        sessionStorage.removeItem('_pending_pair_request');
+        sessionStorage.removeItem('_pending_pair_app');
+        sessionStorage.removeItem('_pending_pair_url');
+        location.href = '/?pair_request=' + encodeURIComponent(_pending);
+      }} else {{
+        location.href = '/';
+      }}
     }} else {{
       err.textContent = d.error || 'Login fehlgeschlagen'; err.style.display = 'block';
       btn.disabled = false; btn.textContent = 'Anmelden';
@@ -14102,7 +16548,16 @@ async function doLogin2FA() {{
     const d = await r.json();
     if (d.authenticated) {{
       // XSS-Hardening 2026-04-30: Cookie kommt vom Server per HttpOnly.
-      location.href = '/';
+      // Pair-Resume: pending pair_request → direkt dahin
+      const _pending = sessionStorage.getItem('_pending_pair_request');
+      if (_pending) {{
+        sessionStorage.removeItem('_pending_pair_request');
+        sessionStorage.removeItem('_pending_pair_app');
+        sessionStorage.removeItem('_pending_pair_url');
+        location.href = '/?pair_request=' + encodeURIComponent(_pending);
+      }} else {{
+        location.href = '/';
+      }}
     }} else {{
       err.textContent = d.error || '2FA fehlgeschlagen'; err.style.display = 'block';
     }}
@@ -14132,6 +16587,7 @@ function showDashTab(tab) {{
   if (tab === 'amt') amtLoadWatchlist();
   if (tab === 'sicherheit') {{ loadCurrentEmail(); loadSaltInfo(); }}
   if (tab === 'whitelist') {{ doWhitelistLoad(); }}
+  if (tab === 'verbunden') loadConnections();
   // Karteikasten-Optik: aktiver Tab verschmilzt mit Inhalt
   document.querySelectorAll('.dash-tab').forEach(btn => {{
     const active = btn.dataset.tab === tab;
@@ -14175,6 +16631,18 @@ async function loadServerStatus() {{
     }} else if (stripeInfo) {{
       stripeInfo.textContent = 'Noch nicht konfiguriert.';
     }}
+    // PayPal
+    const paypalStat = document.getElementById('srv-paypal-status');
+    const paypalInfo = document.getElementById('srv-paypal-info');
+    if (paypalStat && d.paypal) paypalStat.innerHTML = d.paypal.configured ? '<span style="color:#4caf50;">✅ Aktiv (' + (d.paypal.mode || 'sandbox') + ')</span>' : '<span style="color:#665540;">⚪ Nicht eingerichtet</span>';
+    if (paypalInfo && d.paypal && d.paypal.configured) {{
+      paypalInfo.innerHTML = 'Mode: <strong>' + (d.paypal.mode || 'sandbox') + '</strong><br>Client-ID: <code style="word-break:break-all;font-size:9px;">' + (d.paypal.client_id_masked || '–') + '</code><br>Secret: ' + (d.paypal.client_secret_set ? 'gesetzt' : 'nicht gesetzt') + '<br>Webhook: ' + (d.paypal.webhook_id_set ? '<code>' + (d.paypal.webhook_id_masked || '–') + '</code>' : 'nicht gesetzt');
+    }} else if (paypalInfo) {{
+      paypalInfo.textContent = 'Noch nicht konfiguriert.';
+    }}
+    // PayPal Mode-Selektor im Edit-Feld vorausfüllen
+    const paypalModeInput = document.getElementById('paypal-mode');
+    if (paypalModeInput && d.paypal && d.paypal.mode) paypalModeInput.value = d.paypal.mode;
     // Veriff
     const veriffStat = document.getElementById('srv-veriff-status');
     const veriffInfo = document.getElementById('srv-veriff-info');
@@ -14521,7 +16989,255 @@ document.addEventListener('DOMContentLoaded', () => {{
   _bindShareCopyHandlers();
   updateShareBanner();
   setInterval(updateShareBanner, 30000);
+  // Pair-Flow: wenn ?pair_request=... in der URL — internen Handel starten
+  const _params = new URLSearchParams(window.location.search);
+  const _pairReq = _params.get('pair_request');
+  console.log('[PAIR] DOMContentLoaded — pair_request:', _pairReq, 'pending in storage:', sessionStorage.getItem('_pending_pair_request'));
+  if (_pairReq) {{
+    // Pair-App-Daten: erst URL/sessionStorage, dann Server-Fallback (Hasi-Diktat 2026-05-03)
+    // HttpOnly-Cookie kann JS NICHT sehen → wir prüfen Login NUR via /api/identity
+    (async () => {{
+      let _srcApp = _params.get('app') || sessionStorage.getItem('_pending_pair_app') || '';
+      let _srcUrl = _params.get('app_url') || sessionStorage.getItem('_pending_pair_url') || '';
+      // Server kennt source_app/source_url aus pair_request_create — abholen wenn leer
+      if (!_srcApp) {{
+        try {{
+          const pr = await fetch('/api/account/pair/request?request_id=' + encodeURIComponent(_pairReq), {{credentials:'same-origin'}});
+          if (pr.ok) {{
+            const prd = await pr.json();
+            _srcApp = prd.source_app || 'Unbekanntes Programm';
+            _srcUrl = prd.source_url || _srcUrl;
+          }} else {{
+            _srcApp = 'Unbekanntes Programm';
+          }}
+        }} catch(e) {{ _srcApp = 'Unbekanntes Programm'; }}
+      }}
+      // Login-Check via API (HttpOnly-Cookie wird automatisch mitgeschickt)
+      try {{
+        const me = await fetch('/api/identity', {{credentials:'same-origin'}});
+        console.log('[PAIR] /api/identity status:', me.status, 'app:', _srcApp);
+        if (me.ok) {{
+          showPairApproveModal(_pairReq, _srcApp, _srcUrl);
+        }} else {{
+          _redirectToLoginWithPairBanner(_pairReq, _srcApp, _srcUrl);
+        }}
+      }} catch(err) {{
+        console.error('[PAIR] /api/identity error:', err);
+        _redirectToLoginWithPairBanner(_pairReq, _srcApp, _srcUrl);
+      }}
+    }})();
+  }} else {{
+    // Login-Form: Banner zeigen wenn ein Pair-Request pending ist
+    const _pending = sessionStorage.getItem('_pending_pair_request');
+    if (_pending) {{
+      _showPairWaitingBanner();
+    }}
+  }}
+
+  // Deeplink-Auto-Open: ?open_tab=... &open_section=... &open_edit=... aus URL lesen +
+  // entsprechenden Tab/Section/Edit-Box auto-öffnen. Nur ausgeführt wenn Funktionen
+  // verfügbar (=Owner-Dashboard gerendert ist). Whitelist clientseitig
+  // bewusst lasch — der Server hat schon validiert was gültig war.
+  const _openTab = _params.get('open_tab');
+  const _openSection = _params.get('open_section');
+  const _openEdit = _params.get('open_edit');
+  if (_openTab || _openSection || _openEdit) {{
+    // Kurz warten damit andere Init-Routinen abgeschlossen sind, dann öffnen
+    setTimeout(() => {{
+      try {{
+        if (_openTab && typeof showDashTab === 'function') {{
+          showDashTab(_openTab);
+        }}
+        if (_openSection && typeof showSection === 'function') {{
+          showSection(_openSection);
+        }}
+        if (_openEdit) {{
+          // srv-<name>-edit-Box explizit aufklappen (nicht togglen — wir wollen "auf")
+          const _editEl = document.getElementById('srv-' + _openEdit + '-edit');
+          if (_editEl) {{
+            _editEl.style.display = 'block';
+            // Scroll auf die umgebende Provider-Card (Header + Edit zusammen),
+            // damit Card-Titel oben sichtbar ist und Edit-Box drunter direkt im Blick.
+            const _scrollTarget = _editEl.parentElement || _editEl;
+            _scrollTarget.scrollIntoView({{behavior: 'smooth', block: 'start'}});
+          }}
+        }}
+        // URL aufräumen damit Reload nicht erneut auto-öffnet
+        const _u = new URL(window.location.href);
+        _u.searchParams.delete('open_tab');
+        _u.searchParams.delete('open_section');
+        _u.searchParams.delete('open_edit');
+        window.history.replaceState({{}}, '', _u.toString());
+      }} catch (e) {{
+        console.warn('[DEEPLINK] Auto-Open fehlgeschlagen:', e);
+      }}
+    }}, 300);
+  }}
 }});
+
+function _redirectToLoginWithPairBanner(reqId, srcApp, srcUrl) {{
+  // Pair-Daten merken + zur Login-Form bringen (URL ohne pair_request damit
+  // die normale Login-Form sichtbar wird, nicht das Modal)
+  sessionStorage.setItem('_pending_pair_request', reqId);
+  sessionStorage.setItem('_pending_pair_app', srcApp);
+  sessionStorage.setItem('_pending_pair_url', srcUrl);
+  window.location.href = '/';
+}}
+
+function _showPairWaitingBanner() {{
+  const app = sessionStorage.getItem('_pending_pair_app') || 'Unbekanntes Programm';
+  const url = sessionStorage.getItem('_pending_pair_url') || '';
+  const _esc = s => String(s||'').replace(/[&<>"']/g, m => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[m]));
+  const banner = document.createElement('div');
+  banner.id = 'pair-waiting-banner';
+  banner.style.cssText = 'position:fixed;top:18px;left:50%;transform:translateX(-50%);width:75%;max-width:720px;z-index:9998;background:linear-gradient(135deg,rgba(126,91,239,0.18),rgba(224,160,112,0.18));border:1px solid rgba(160,112,224,0.4);border-radius:12px;padding:14px 22px;text-align:center;color:#e0d8c8;font-size:13px;backdrop-filter:blur(6px);box-shadow:0 6px 28px rgba(0,0,0,0.4);';
+  banner.innerHTML = `
+    <strong style="color:#a070e0;">🦋 Programm-Anfrage wartet:</strong>
+    <span style="color:#e0d8c8;"> ${{_esc(app)}}</span>
+    ${{url ? `<span style="color:#665540;font-size:11px;"> · ${{_esc(url)}}</span>` : ''}}
+    <span style="color:#998870;font-size:11px;display:block;margin-top:3px;">Bitte einloggen — danach kommt automatisch der Bestätigungs-Dialog.</span>
+  `;
+  document.body.appendChild(banner);
+  document.body.style.paddingTop = '90px';
+}}
+
+// === Pair-Flow Approve-Modal (Hasi-Diktat 2026-05-03) ===
+async function showPairApproveModal(requestId, sourceApp, sourceUrl) {{
+  // Request-Slot beim Backend anlegen (falls nicht schon da)
+  try {{
+    await fetch('/api/account/pair/request', {{
+      credentials: 'same-origin',
+      method:'POST',
+      headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{request_id: requestId, source_app: sourceApp, source_url: sourceUrl}})
+    }});
+  }} catch(e) {{}}
+
+  // Check ob User eingeloggt ist — Hasi-Diktat 2026-05-03: HttpOnly-Cookie ist für JS unsichtbar.
+  // Direkt /api/identity probieren, Cookie wird via credentials:'same-origin' automatisch mitgeschickt.
+  let _isLoggedIn = false;
+  try {{
+    const me = await fetch('/api/identity', {{credentials:'same-origin'}});
+    _isLoggedIn = me.ok;
+  }} catch(e) {{}}
+
+  const modal = document.createElement('div');
+  modal.id = 'pair-approve-modal';
+  modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:99999;display:flex;align-items:center;justify-content:center;';
+  const _esc = s => String(s||'').replace(/[&<>"']/g, m => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[m]));
+  modal.innerHTML = `
+    <div style="background:#10101a;border:1px solid #3a2a5a;border-radius:14px;padding:32px 40px;max-width:480px;text-align:center;box-shadow:0 0 80px rgba(122,184,224,0.3);">
+      <div style="font-size:48px;margin-bottom:8px;">🦋</div>
+      <h2 style="color:#a070e0;font-size:20px;margin:0 0 12px;">Programm-Verbindung erlauben?</h2>
+      <p style="color:#998870;font-size:13px;margin:0 0 18px;line-height:1.5;">
+        <strong style="color:#7ab8e0;">${{_esc(sourceApp)}}</strong> möchte sich mit deinem ShinNexus-Account verbinden
+        und automatisch Token bekommen.
+      </p>
+      <div style="background:rgba(20,20,30,0.5);border:1px solid #2a2a3a;border-radius:8px;padding:12px;margin-bottom:18px;text-align:left;font-size:11px;color:#665540;">
+        <div><strong style="color:#e0d8c8;">App:</strong> ${{_esc(sourceApp)}}</div>
+        <div><strong style="color:#e0d8c8;">URL:</strong> <code style="color:#7ab8e0;">${{_esc(sourceUrl||'unbekannt')}}</code></div>
+        <div style="margin-top:6px;color:#7ab8e0;">Scopes: profile:read, email:read</div>
+      </div>
+      ${{_isLoggedIn ? `
+        <input type="text" id="pair-label-hint" placeholder="Label (optional, z.B. 'Heimwerker-PC')"
+               style="width:100%;padding:10px;background:#1a1a2a;color:#e0d8c8;border:1px solid #2a2a3a;border-radius:6px;font-size:12px;margin-bottom:14px;box-sizing:border-box;">
+        <div style="display:flex;gap:10px;justify-content:center;">
+          <button onclick="denyPairRequest('${{_esc(requestId)}}')"
+                  style="flex:1;padding:11px 18px;background:rgba(228,68,68,0.15);color:#e84a4a;border:1px solid rgba(228,68,68,0.4);border-radius:8px;cursor:pointer;font-size:13px;">
+            ✖ Ablehnen
+          </button>
+          <button onclick="approvePairRequest('${{_esc(requestId)}}')"
+                  style="flex:1;padding:11px 18px;background:linear-gradient(135deg,#7e5bef,#e0a070);color:white;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;">
+            ✓ Erlauben
+          </button>
+        </div>
+      ` : `
+        <div style="background:rgba(232,196,100,0.12);border:1px solid rgba(232,196,100,0.4);border-radius:8px;padding:14px;margin-bottom:14px;">
+          <div style="font-size:14px;color:#e8c464;margin-bottom:6px;">🔒 Bitte zuerst anmelden</div>
+          <p style="font-size:11px;color:#998870;margin:0 0 10px;line-height:1.5;">
+            Du musst in deinem ShinNexus eingeloggt sein um Programme zu verbinden.
+            Diese Pair-Anfrage bleibt 10 Minuten gültig.
+          </p>
+          <button onclick="closePairModalKeepReq()" style="width:100%;padding:11px;background:linear-gradient(135deg,#7e5bef,#e0a070);color:white;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;">
+            🔓 Zum Login
+          </button>
+          <p style="font-size:10px;color:#665540;margin:10px 0 0;text-align:left;">
+            Nach erfolgreichem Login + 2FA-Bestätigung: einfach diesen Tab erneut öffnen
+            (URL bleibt gleich) — dann erscheint der Approve-Button.
+          </p>
+        </div>
+        <button onclick="denyPairRequest('${{_esc(requestId)}}')"
+                style="width:100%;padding:9px;background:rgba(228,68,68,0.10);color:#e84a4a;border:1px solid rgba(228,68,68,0.3);border-radius:6px;cursor:pointer;font-size:12px;">
+          Anfrage abbrechen
+        </button>
+      `}}
+      <p id="pair-modal-msg" style="margin:14px 0 0;font-size:11px;color:#665540;"></p>
+    </div>`;
+  document.body.appendChild(modal);
+}}
+
+function closePairModalKeepReq() {{
+  // Pair-ID in sessionStorage merken + navigiere zur sauberen Login-Form
+  // (URL ohne pair_request damit Login-Form normal funktioniert).
+  // Nach erfolgreichem Login wird der DOMContentLoaded-Check unten den Pair-Request
+  // wieder aufgreifen + URL umbiegen → Modal kommt automatisch.
+  const _params = new URLSearchParams(window.location.search);
+  const _reqId = _params.get('pair_request');
+  if (_reqId) sessionStorage.setItem('_pending_pair_request', _reqId);
+  document.getElementById('pair-approve-modal')?.remove();
+  window.location.href = '/';
+}}
+
+async function approvePairRequest(requestId) {{
+  const msg = document.getElementById('pair-modal-msg');
+  const labelHint = (document.getElementById('pair-label-hint')?.value || '').trim();
+  msg.textContent = 'Wird verarbeitet…'; msg.style.color = '#7ab8e0';
+  const token = document.cookie.split(';').find(c => c.trim().startsWith('nexus_session='))?.split('=')[1] || '';
+  try {{
+    const r = await fetch('/api/account/pair/request/approve', {{
+      credentials: 'same-origin',
+      method:'POST',
+      headers:{{'Content-Type':'application/json','X-Session-Token':token}},
+      body: JSON.stringify({{request_id: requestId, label_hint: labelHint}})
+    }});
+    const d = await r.json().catch(() => ({{}}));
+    if (!r.ok) {{
+      msg.style.color = '#e88080';
+      msg.textContent = '✖ ' + (d.error || ('HTTP ' + r.status));
+      return;
+    }}
+    msg.style.color = '#7ce0a4';
+    msg.innerHTML = '✅ Verbunden! Du kannst diesen Tab jetzt schließen — die App holt sich den Token automatisch.';
+    setTimeout(() => {{
+      const modal = document.getElementById('pair-approve-modal');
+      if (modal) modal.remove();
+      // Saubere URL ohne pair_request param
+      window.history.replaceState({{}}, '', window.location.pathname);
+    }}, 2500);
+  }} catch (e) {{
+    msg.style.color = '#e88080';
+    msg.textContent = '✖ ' + e.message;
+  }}
+}}
+
+async function denyPairRequest(requestId) {{
+  const msg = document.getElementById('pair-modal-msg');
+  const token = document.cookie.split(';').find(c => c.trim().startsWith('nexus_session='))?.split('=')[1] || '';
+  try {{
+    await fetch('/api/account/pair/request/deny', {{
+      credentials: 'same-origin',
+      method:'POST',
+      headers:{{'Content-Type':'application/json','X-Session-Token':token}},
+      body: JSON.stringify({{request_id: requestId}})
+    }});
+  }} catch(e) {{}}
+  msg.style.color = '#e88080';
+  msg.textContent = '✖ Abgelehnt. Tab schließen.';
+  setTimeout(() => {{
+    document.getElementById('pair-approve-modal')?.remove();
+    window.history.replaceState({{}}, '', window.location.pathname);
+  }}, 1800);
+}}
 
 async function loadPublicUrlSection() {{
   const token = document.cookie.split(';').find(c => c.trim().startsWith('nexus_session='))?.split('=')[1] || '';
@@ -14823,6 +17539,209 @@ function loadVerifyAmtWatchlistPreview() {{
 function _amtListsToken() {{
   return document.cookie.split(';').find(c => c.trim().startsWith('nexus_session='))?.split('=')[1] || '';
 }}
+// === Pair-API: Verbundene Programme ===
+function _nexusSessionToken() {{
+  return document.cookie.split(';').find(c => c.trim().startsWith('nexus_session='))?.split('=')[1] || '';
+}}
+function _pairEsc(s) {{
+  return String(s == null ? '' : s).replace(/[&<>"']/g, m => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[m]));
+}}
+
+async function loadConnections() {{
+  const wrap = document.getElementById('connections-list');
+  if (!wrap) return;
+  wrap.innerHTML = '<p style="color:#665540;">Lade Verbindungen…</p>';
+  try {{
+    const r = await fetch('/api/account/connections', {{
+      credentials: 'same-origin',
+      headers: {{'X-Session-Token': _nexusSessionToken()}}
+    }});
+    if (!r.ok) {{
+      const _e = await r.json().catch(() => ({{}}));
+      wrap.innerHTML = `<p style="color:#e88080;">Fehler beim Laden — HTTP ${{r.status}}: ${{_pairEsc(_e.error || 'unbekannt')}}</p>`;
+      return;
+    }}
+    const d = await r.json();
+    const conns = d.connections || [];
+    if (!conns.length) {{
+      wrap.innerHTML = '<p style="color:#665540;font-style:italic;">Noch keine Programme verbunden.<br>Klick oben rechts auf <strong>➕ Neues Programm verbinden</strong>.</p>';
+      return;
+    }}
+    wrap.innerHTML = conns.map(c => {{
+      const created = new Date((c.created_at || 0) * 1000).toLocaleString('de-DE');
+      const lastUsed = c.last_used_at ? new Date(c.last_used_at * 1000).toLocaleString('de-DE') : '—';
+      const lastRefreshed = c.last_refreshed_at ? new Date(c.last_refreshed_at * 1000).toLocaleString('de-DE') : '—';
+      const label = c.label_hint ? ` <span style="color:#7ab8e0;">· ${{_pairEsc(c.label_hint)}}</span>` : '';
+      // Vorschuss-Badge: pending = Programm hat den neuen Token noch nicht abgeholt
+      const pendingBadge = c.pending_token_hash
+        ? `<span style="display:inline-block;margin-left:6px;padding:2px 8px;font-size:9px;background:rgba(232,196,100,0.2);color:#e8c464;border:1px solid rgba(232,196,100,0.4);border-radius:10px;" title="Programm muss noch den neuen Token abholen — sonst manuell revoken!">🟡 Vorschuss ausstehend</span>`
+        : '';
+      // Hasi-Diktat 2026-05-05 (Trick 17): Owner-Connections kriegen Krone + Gold-Border
+      const isOwner = c.verification_level === 'owner';
+      const ownerBadge = isOwner
+        ? `<span style="display:inline-block;margin-left:6px;padding:2px 8px;font-size:9px;background:rgba(212,175,55,0.15);color:#d4af37;border:1px solid rgba(212,175,55,0.5);border-radius:10px;letter-spacing:0.05em;" title="Owner-Programm — Lösch-Schutz aktiv">👑 OWNER</span>`
+        : '';
+      const cardBorder = isOwner ? '1px solid rgba(212,175,55,0.45)' : (c.pending_token_hash ? '1px solid rgba(232,196,100,0.4)' : '1px solid #2a2a3a');
+      const cardShadow = isOwner ? 'box-shadow:0 0 12px rgba(212,175,55,0.08);' : '';
+      const icon = isOwner ? '👑' : '🦋';
+      const buttonStyle = isOwner
+        ? 'font-size:10px;padding:5px 10px;background:rgba(228,68,68,0.18);color:#e84a4a;border:1px solid rgba(228,68,68,0.6);border-radius:6px;cursor:pointer;white-space:nowrap;'
+        : 'font-size:10px;padding:5px 10px;background:rgba(228,68,68,0.15);color:#e84a4a;border:1px solid rgba(228,68,68,0.4);border-radius:6px;cursor:pointer;white-space:nowrap;';
+      const buttonLabel = isOwner ? '🛡 Owner-Revoke' : '🗑 Revoke';
+      const buttonTitle = isOwner
+        ? 'Owner-Connection löschen — braucht PW + 2FA + Bestätigung. Vault auf Programm-Seite wird ohne Recovery-Seed unzugänglich!'
+        : 'Token revoken — Programm verliert sofort den Zugriff';
+      return `
+        <div style="background:rgba(20,20,30,0.5);border:${{cardBorder}};${{cardShadow}}border-radius:8px;padding:12px 14px;margin-bottom:8px;">
+          <div style="display:flex;justify-content:space-between;align-items:start;gap:10px;">
+            <div style="flex:1;min-width:0;">
+              <div style="color:#e0d8c8;font-weight:600;font-size:13px;">
+                ${{icon}} ${{_pairEsc(c.source_app)}}${{label}}${{ownerBadge}}${{pendingBadge}}
+              </div>
+              <div style="color:#665540;font-size:10px;margin-top:4px;">
+                ${{_pairEsc(c.source_url || 'unbekannte URL')}} · v${{_pairEsc(c.source_version || '?')}}
+              </div>
+              <div style="color:#665540;font-size:10px;margin-top:2px;">
+                verbunden ${{created}} · zuletzt benutzt: ${{lastUsed}}
+              </div>
+              <div style="color:#665540;font-size:10px;margin-top:2px;">
+                letzter Token-Refresh: ${{lastRefreshed}}
+              </div>
+              <div style="color:#a070e0;font-size:9px;margin-top:4px;">
+                Scopes: ${{(c.scopes || []).map(_pairEsc).join(', ')}}
+              </div>
+            </div>
+            <button onclick="revokeConnection('${{_pairEsc(c.connection_id)}}', ${{isOwner ? 'true' : 'false'}})"
+                    style="${{buttonStyle}}"
+                    title="${{buttonTitle}}">${{buttonLabel}}</button>
+          </div>
+        </div>`;
+    }}).join('');
+  }} catch (e) {{
+    wrap.innerHTML = '<p style="color:#e88080;">Fehler: ' + _pairEsc(e.message) + '</p>';
+  }}
+}}
+
+let _pairTtlTimer = null;
+
+async function startPair(regenerate) {{
+  const labelEl = document.getElementById('pair-label-hint');
+  const labelHint = (labelEl && labelEl.value || '').trim();
+  try {{
+    const r = await fetch('/api/account/pair/start', {{
+      credentials: 'same-origin',
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json', 'X-Session-Token': _nexusSessionToken()}},
+      body: JSON.stringify({{label_hint: labelHint}})
+    }});
+    if (!r.ok) {{
+      const e = await r.json().catch(() => ({{}}));
+      alert('Fehler: ' + (e.error || ('HTTP ' + r.status)));
+      return;
+    }}
+    const d = await r.json();
+    document.getElementById('pair-code-display').textContent = d.code;
+    document.getElementById('pair-modal').style.display = 'flex';
+    // TTL-Counter
+    if (_pairTtlTimer) clearInterval(_pairTtlTimer);
+    let remaining = d.ttl_seconds || 300;
+    const ttlEl = document.getElementById('pair-code-ttl');
+    const updateTtl = () => {{
+      if (remaining <= 0) {{
+        ttlEl.textContent = '⏱ Abgelaufen — neuen Code generieren';
+        ttlEl.style.color = '#e84a4a';
+        clearInterval(_pairTtlTimer);
+        return;
+      }}
+      const m = Math.floor(remaining / 60);
+      const s = remaining % 60;
+      ttlEl.textContent = `Gültig noch ${{m}}:${{String(s).padStart(2,'0')}} min`;
+      ttlEl.style.color = remaining < 60 ? '#e8c464' : '#e8c464';
+      remaining--;
+    }};
+    updateTtl();
+    _pairTtlTimer = setInterval(updateTtl, 1000);
+  }} catch (e) {{
+    alert('Fehler: ' + e.message);
+  }}
+}}
+
+function closePairModal() {{
+  document.getElementById('pair-modal').style.display = 'none';
+  if (_pairTtlTimer) clearInterval(_pairTtlTimer);
+  loadConnections();  // Liste refreshen falls eingelöst wurde
+}}
+
+async function rollVorschuss() {{
+  const _msg = '🎲 Vertrauensvorschuss würfeln?\\n\\n' +
+               'Für ALLE aktiven Programme wird ein neuer Token bereitgestellt.\\n' +
+               'Der ALTE Token bleibt aktiv bis das Programm sich meldet — dann Tausch.\\n' +
+               'Inaktive Programme behalten den alten Token, sind aber als 🟡 markiert ' +
+               'damit du sie manuell revoken kannst.\\n\\n' +
+               '1× pro 24h möglich.';
+  if (!confirm(_msg)) return;
+  const status = document.getElementById('vorschuss-status');
+  status.textContent = '🎲 Würfle…';
+  status.style.color = '#7ab8e0';
+  try {{
+    const r = await fetch('/api/account/vorschuss/roll', {{
+      credentials: 'same-origin',
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json', 'X-Session-Token': _nexusSessionToken()}},
+      body: JSON.stringify({{}})
+    }});
+    const d = await r.json().catch(() => ({{}}));
+    if (!r.ok) {{
+      status.style.color = '#e88080';
+      status.textContent = '✖ ' + (d.error || ('HTTP ' + r.status));
+      return;
+    }}
+    const next = d.next_allowed_at ? new Date(d.next_allowed_at * 1000).toLocaleString('de-DE') : '?';
+    status.style.color = '#7ce0a4';
+    status.textContent = `✅ ${{(d.rolled || []).length}} Programme würfeln, ` +
+                         `${{(d.skipped || []).length}} übersprungen (hatten schon pending). ` +
+                         `Nächster Vorschuss ab: ${{next}}`;
+    loadConnections();
+  }} catch (e) {{
+    status.style.color = '#e88080';
+    status.textContent = '✖ ' + e.message;
+  }}
+}}
+
+async function revokeConnection(connId, isOwner) {{
+  // Hasi-Diktat 2026-05-05 (Trick 17 / Owner-Lösch-Schutz):
+  // Owner-Connections brauchen extra PW + 2FA + Doppel-Bestätigung,
+  // weil das Löschen den Vault auf der Programm-Seite ohne Recovery-Seed
+  // dauerhaft unzugänglich macht.
+  let body = {{connection_id: connId, reason: 'owner_initiated'}};
+  if (isOwner) {{
+    if (!confirm('ACHTUNG: Owner-Programm-Connection löschen. Das Programm verliert sofort den Zugriff. Der zugehörige Vault auf der Programm-Seite wird unzugänglich — Wiederherstellung NUR via Recovery-Seed möglich. Wirklich destruktiv löschen?')) return;
+    const pw = prompt('Owner-Passwort zur Bestätigung:');
+    if (pw === null || !pw) return;
+    const totp = prompt('2FA-Code (leer wenn 2FA deaktiviert):') || '';
+    if (!confirm('Letzte Warnung: dieser Schritt ist nicht rückgängig zu machen ohne Recovery-Seed. Wirklich endgültig löschen?')) return;
+    body = {{connection_id: connId, reason: 'owner_destructive', password: pw, totp_code: totp, confirm_destructive: true}};
+  }} else {{
+    if (!confirm('Verbindung wirklich revoken? Das Programm verliert sofort den Zugriff.')) return;
+  }}
+  try {{
+    const r = await fetch('/api/account/connections/revoke', {{
+      credentials: 'same-origin',
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json', 'X-Session-Token': _nexusSessionToken()}},
+      body: JSON.stringify(body)
+    }});
+    if (!r.ok) {{
+      const e = await r.json().catch(() => ({{}}));
+      alert('Revoke fehlgeschlagen: ' + (e.error || ('HTTP ' + r.status)));
+      return;
+    }}
+    loadConnections();
+  }} catch (e) {{
+    alert('Fehler: ' + e.message);
+  }}
+}}
+
 async function loadAmtLists() {{
   const table = document.getElementById('amt-list-table');
   if (!table) return;
@@ -15296,6 +18215,7 @@ async function loadMyLicense() {{
   loadReceivedLicenses();
   loadIssuedLicenses();
 }}
+
 
 async function loadReceivedLicenses() {{
   const box = document.getElementById('received-licenses');
@@ -16190,6 +19110,27 @@ async function doStripeSave() {{
     if (msg) {{ msg.textContent = '❌ Netzwerkfehler: ' + e.message; msg.style.color = '#e55'; }}
   }}
 }}
+async function doPaypalSave() {{
+  const cid = document.getElementById('paypal-client-id')?.value?.trim();
+  const cs = document.getElementById('paypal-client-secret')?.value?.trim();
+  const wh = document.getElementById('paypal-webhook-id')?.value?.trim() || '';
+  const mode = document.getElementById('paypal-mode')?.value || 'sandbox';
+  const msg = document.getElementById('paypal-msg');
+  if (!cid) {{ if (msg) {{ msg.textContent = 'Client ID nötig!'; msg.style.color = '#e55'; }} return; }}
+  if (!cs) {{ if (msg) {{ msg.textContent = 'Client Secret nötig!'; msg.style.color = '#e55'; }} return; }}
+  const token = document.cookie.split(';').find(c => c.trim().startsWith('nexus_session='))?.split('=')[1] || '';
+  if (msg) {{ msg.textContent = '⏳ Speichere…'; msg.style.color = '#888'; }}
+  try {{
+    const r = await fetch('/api/paypal/config', {{method:'POST', headers:{{'Content-Type':'application/json','X-Session-Token':token}}, body:JSON.stringify({{paypal_client_id:cid, paypal_client_secret:cs, paypal_webhook_id:wh, paypal_mode:mode}})}});
+    const d = await r.json();
+    if (msg) {{
+      if (d.ok) {{ msg.textContent = '✅ PayPal konfiguriert (' + (d.mode || mode) + ')!'; msg.style.color = '#4a4'; setTimeout(() => location.reload(), 1500); }}
+      else {{ msg.textContent = d.error || 'Fehler'; msg.style.color = '#e55'; }}
+    }}
+  }} catch (e) {{
+    if (msg) {{ msg.textContent = '❌ Netzwerkfehler: ' + e.message; msg.style.color = '#e55'; }}
+  }}
+}}
 async function doVeriffToggle(enabled) {{
   const token = document.cookie.split(';').find(c => c.trim().startsWith('nexus_session='))?.split('=')[1] || '';
   try {{
@@ -16593,9 +19534,14 @@ document.addEventListener('keydown', e => {{
     fetch('/api/verify/status', {{headers: {{'X-Session-Token': token}}}})
       .then(r => r.json())
       .then(d => {{
+        // Auth-Fehler oder kaputte Antwort? Initial-State (grayscale "ShinNexus") behalten,
+        // statt fälschlich "nicht verbunden" zu zeigen.
+        if (d && d.error) return;
+        if (typeof d.effective_level === 'undefined' && typeof d.verification_level === 'undefined') return;
         // effective_level berücksichtigt card_pending_replacement (während Austausch = 0)
         const lvl = (typeof d.effective_level !== 'undefined') ? d.effective_level : (d.verification_level || 0);
-        const labels = ['❌ Nicht verifiziert', '✅ Stufe 1 (Kreditkarte)', '✅ Stufe 2 (Perso)', '✅ Stufe 3 (Amtlich)'];
+        // 5-Stufen-Schema (Hasi-Diktat 2026-05-03):
+        const labels = ['❌ Nicht verbunden', '✅ Stufe 1 (Verbunden)', '✅ Stufe 2 (18+ / KK)', '✅ Stufe 3 (Verifiziert / Perso)', '✅ Stufe 4 (Amtlich)'];
         if (verifyStatus) verifyStatus.innerHTML = '🛡️ ' + (labels[lvl] || labels[0]);
         // Profil-Schild aktualisieren (Farbe + Status-Text)
         const shieldImg = document.getElementById('profile-shield-img');
@@ -16603,7 +19549,7 @@ document.addEventListener('keydown', e => {{
         const profVerified = document.getElementById('profile-verified');
         if (shieldImg) {{
           const basisOk = shieldImg.dataset.basisOk === '1';
-          if (lvl >= 3) {{
+          if (lvl >= 4) {{
             // Stufe 3: Amt-bestätigt — edler Schild mit dynamischem 25-Slot-Glow
             shieldImg.src = '/ShinNexus-Shield-edel.png?v=4';
             shieldImg.style.animation = '';
@@ -16636,17 +19582,20 @@ document.addEventListener('keydown', e => {{
               shieldImg.style.filter = 'drop-shadow(0 0 18px '+c+') drop-shadow(0 0 10px '+c2+') drop-shadow(0 0 28px '+c+')';
               _glowIdx = (_glowIdx + 1) % 25;
             }}, 320);
-          }} else if (lvl >= 2) {{
+          }} else if (lvl >= 3) {{
+            // Stufe 3 — Verifiziert (Veriff/Perso): blaues Schild + goldener Schein
             shieldImg.src = '/ShinNexus-Shield.png';
             shieldImg.style.filter = 'drop-shadow(0 0 12px #d4a850) drop-shadow(0 0 6px #d4a850)';
             shieldImg.style.animation = '';
-            if (shieldLabel) {{ shieldLabel.style.color = '#d4a850'; shieldLabel.textContent = 'Identität bestätigt'; }}
-          }} else if (lvl >= 1) {{
+            if (shieldLabel) {{ shieldLabel.style.color = '#d4a850'; shieldLabel.textContent = 'Verifiziert'; }}
+          }} else if (lvl >= 2) {{
+            // Stufe 2 — 18+ (Stripe): blaues Schild + roter Glow
             shieldImg.src = '/ShinNexus-Shield.png';
             shieldImg.style.filter = 'drop-shadow(0 0 12px #e44) drop-shadow(0 0 6px #e44)';
             shieldImg.style.animation = '';
             if (shieldLabel) {{ shieldLabel.style.color = '#e44'; shieldLabel.textContent = '18+'; }}
-          }} else if (basisOk) {{
+          }} else if (lvl >= 1 || basisOk) {{
+            // Stufe 1 — Verbunden (Email): blaues Schild + weißer Schein
             shieldImg.src = '/ShinNexus-Shield.png';
             shieldImg.style.filter = 'drop-shadow(0 0 12px #fff) drop-shadow(0 0 6px #fff)';
             shieldImg.style.animation = '';
@@ -16655,7 +19604,7 @@ document.addEventListener('keydown', e => {{
             shieldImg.src = '/ShinNexus-Shield.png';
             shieldImg.style.filter = 'grayscale(100%)';
             shieldImg.style.animation = '';
-            if (shieldLabel) {{ shieldLabel.style.color = '#665540'; shieldLabel.textContent = 'ShinNexus'; }}
+            if (shieldLabel) {{ shieldLabel.style.color = '#665540'; shieldLabel.textContent = 'nicht verbunden'; }}
           }}
         }}
         if (lvl > 0 && ausweisBtn) ausweisBtn.style.display = 'inline-block';
@@ -16680,7 +19629,9 @@ document.addEventListener('keydown', e => {{
           cardTop.style.display = 'none';
         }}
         // Flag-basiert statt Level-basiert — Stripe und Veriff sind UNABHÄNGIG (Kinder brauchen Perso ohne KK)
-        const hasKK = !!d.verified_stripe;
+        // Card-Replace-Pending: Stufe 1 muss als "nicht aktiv" angezeigt werden damit der User
+        // den Stripe-Flow neu durchlaufen kann (verified_stripe-Flag bleibt by design für Stufen-Erhalt).
+        const hasKK = !!d.verified_stripe && !d.card_pending_replacement;
         const hasPerso = !!d.id_verified;
         const veriffRow = document.getElementById('verify-veriff-row');
         const veriffStartBtn = document.getElementById('veriff-start-btn');
@@ -16778,7 +19729,7 @@ document.addEventListener('keydown', e => {{
             window._verifyServerPollInterval = setInterval(() => {{
               const tk = document.cookie.split(';').find(c => c.trim().startsWith('nexus_session='))?.split('=')[1] || '';
               fetch('/api/verify/status', {{headers: {{'X-Session-Token': tk}}}}).then(rr => rr.json()).then(sd => {{
-                if (sd.verification_level >= 2) {{
+                if (sd.verification_level >= 3) {{
                   clearInterval(window._verifyCounterInterval); window._verifyCounterInterval = null;
                   clearInterval(window._verifyServerPollInterval); window._verifyServerPollInterval = null;
                   window._pendingVeriffStart = null;
@@ -17960,11 +20911,14 @@ def cli_onboarding(cfg: dict):
             "host": smtp_host,
             "port": int(smtp_port),
             "user": smtp_user,
-            "password": smtp_pass,
             "from": smtp_from,
         }
         save_config(cfg)
-        print("  ✅ SMTP gespeichert! Teste Verbindung...")
+        # PW separat in Vault — niemals plain im Config-JSON
+        if not _save_smtp_password(smtp_pass):
+            print("  ⚠️ Vault zu — SMTP-PW konnte nicht gesichert werden! Abbruch.")
+            continue
+        print("  ✅ SMTP gespeichert (PW im Vault)! Teste Verbindung...")
 
         # Verifizierungs-Mail senden als Test
         print(f"  📧 Sende Verifizierungs-Mail an {email}...")
@@ -18108,6 +21062,7 @@ def cli_recovery(cfg: dict) -> bool:
     _load_friends()
     _load_agents()
     _load_users()
+    _load_connections()
     _load_user_hives()
     _load_migrate_abuse()
     _load_type_switch_abuse()
@@ -18135,6 +21090,7 @@ def cli_unlock(cfg: dict) -> str | None:
     _load_friends()
     _load_agents()
     _load_users()
+    _load_connections()
     # 2FA prüfen wenn aktiviert
     if _identity and _identity.get("totp_confirmed"):
         attempts = 0
@@ -18264,6 +21220,7 @@ def main():
                 _load_friends()
                 _load_agents()
                 _load_users()
+                _load_connections()
                 if _identity:
                     _ensure_keypair(cfg)
                     save_config(cfg)

@@ -87,28 +87,67 @@ graceful_stop_pid() {
 
 case "${1:-start}" in
   start)
+    # Hasi-Diktat: start = auto-replace. Alte Instanz wird sauber gestoppt + neu gestartet.
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-      echo "🛡️ ShinNexus läuft bereits (PID $(cat "$PID_FILE"))"
-      exit 0
+      OLD_PID=$(cat "$PID_FILE")
+      echo "  🔄 Alte Instanz läuft (PID $OLD_PID) — stoppe sauber + restarte..."
+      graceful_stop_pid "$OLD_PID"
+      rm -f "$PID_FILE"
     fi
     # Fremder Prozess auf Port? → wegräumen (Zombies aus Trash-Ordnern etc.)
     FOREIGN_PIDS=$(lsof -t -i :$PORT 2>/dev/null)
     if [ -n "$FOREIGN_PIDS" ]; then
       echo "  ⚠️  Port $PORT belegt von fremdem Prozess (PID $FOREIGN_PIDS) — räume auf..."
+      for p in $FOREIGN_PIDS; do graceful_stop_pid "$p"; done
       wait_port_free
     fi
     setup_env
     show_intro
     mkdir -p "$SCRIPT_DIR/logs"
     cd "$SCRIPT_DIR"
-    echo "  🛡️ Starte ShinNexus..."
-    setsid "$PYTHON" "$MAIN" > /dev/null 2>&1 &
+
+    # Hasi-Diktat 2026-05-05: Wenn keine Igni-Datei vorhanden ist, fragt
+    # ShinNexus beim Start interaktiv nach Owner-PW + 2FA. start.sh holt
+    # die Eingaben ab und pipet sie in den Hintergrund-Prozess, damit auch
+    # ohne Igni ein headless-Start möglich ist.
+    HAS_IGNI=0
+    for igni_dir in "$SCRIPT_DIR"/ShinNexus-Igni*; do
+      if [ -f "$igni_dir/vault_bootstrap.enc" ]; then HAS_IGNI=1; break; fi
+    done
+
+    if [ "$HAS_IGNI" -eq 0 ]; then
+      echo "  🔑 Kein Igni gefunden — Owner-Login einmalig nötig"
+      echo ""
+      read -p "    Wahl [1=Anmelden, 2=Recovery-Seed, ENTER=1]: " CHOICE
+      CHOICE="${CHOICE:-1}"
+      if [ "$CHOICE" = "2" ]; then
+        echo ""
+        echo "  ⚠️  Recovery-Seed-Pfad ist interaktiv mehrstufig — bitte direkt starten:"
+        echo "      $PYTHON $MAIN"
+        echo ""
+        exit 1
+      fi
+      read -srp "    Owner-Passwort: " PW
+      echo ""
+      read -rp "    2FA-Code (leer wenn deaktiviert): " TOTP
+      echo ""
+      echo "  🛡️ Starte ShinNexus (Erst-Login via Pipe)..."
+      START_LOG="$SCRIPT_DIR/logs/start-headless.log"
+      # Pipe Wahl + PW + TOTP an stdin des Hintergrund-Prozesses.
+      # Output landet in start-headless.log statt /dev/null damit Crashes sichtbar sind.
+      printf '%s\n%s\n%s\n' "$CHOICE" "$PW" "$TOTP" \
+        | setsid "$PYTHON" "$MAIN" > "$START_LOG" 2>&1 &
+      unset PW TOTP
+    else
+      echo "  🛡️ Starte ShinNexus..."
+      setsid "$PYTHON" "$MAIN" > /dev/null 2>&1 &
+    fi
     echo $! > "$PID_FILE"
     for i in $(seq 1 5); do
       sleep 1
       lsof -i :$PORT &>/dev/null && break
     done
-    if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    if kill -0 "$(cat "$PID_FILE")" 2>/dev/null && lsof -i :$PORT &>/dev/null; then
       echo ""
       echo "  ╔══════════════════════════════════════╗"
       echo "  ║  ✅ ShinNexus etabliert              ║"
@@ -118,7 +157,7 @@ case "${1:-start}" in
       echo "  ╚══════════════════════════════════════╝"
       echo ""
     else
-      echo "  ❌ Start fehlgeschlagen! Check logs/"
+      echo "  ❌ Start fehlgeschlagen! Check logs/start-headless.log oder logs/"
       rm -f "$PID_FILE"
     fi
     exit 0

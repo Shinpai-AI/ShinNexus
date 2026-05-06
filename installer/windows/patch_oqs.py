@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Shinpai-AI — AGPL-3.0
+# See LICENSE for details. Same Knowledge. Your Ownership.
 """Patcht oqs.py damit die mitgelieferte DLL gefunden wird.
 Wird im GitHub Actions Workflow nach dem Kopieren der oqs-Dateien ausgeführt."""
 import sys, os
